@@ -22,7 +22,7 @@ from gr00t.data.dataset import ModalityConfig
 from gr00t.data.transform.base import ComposedModalityTransform
 from gr00t.data.transform.concat import ConcatTransform
 from gr00t.data.transform.state_action import StateActionSinCosTransform, StateActionToTensor, StateActionTransform
-from gr00t.data.transform.video import VideoColorJitter, VideoToNumpy, VideoToTensor
+from gr00t.data.transform.video import VideoColorJitter, VideoToNumpy, VideoToTensor, VideoCrop, VideoResize
 from gr00t.experiment.data_config import DATA_CONFIG_MAP, BaseDataConfig
 from gr00t.model.transforms import GR00TTransform
 
