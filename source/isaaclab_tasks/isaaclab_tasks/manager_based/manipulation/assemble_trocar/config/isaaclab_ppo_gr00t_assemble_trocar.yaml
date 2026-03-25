@@ -128,6 +128,7 @@ env:
       gpu_resize_height: 224
       gpu_resize_width: 224
       gpu_crop_scale: 0.05   # 0.05 = remove 2.5% from each edge, same as VideoCrop(scale=0.95)
+      gpu_crop_random: true  # per-sample random crop during training
 
       # --- IsaacLab -> RLinf observation mapping ---
       # main_images: single camera key for main view
@@ -196,8 +197,10 @@ env:
       num_envs: null
       max_episode_steps: ${env.eval.max_episode_steps}
       task_description: "install trocar from box"
-    # Reuse IsaacLab config from train section via YAML anchor
-    isaaclab: *isaaclab_config
+    # Reuse IsaacLab config from train, but disable random crop for eval
+    isaaclab:
+      <<: *isaaclab_config
+      gpu_crop_random: false
 
 # ---------------------------------------------------------------------------
 # Rollout

@@ -280,13 +280,14 @@ def _gpu_resize_images(
     target_h: int,
     target_w: int,
     crop_scale: float = 0.0,
+    random_crop: bool = False,
 ) -> torch.Tensor:
     """Crop and resize images entirely on GPU.
 
-    When ``crop_scale > 0``, a center crop is applied first (removing
-    ``crop_scale/2`` fraction from each edge), then the cropped region is
-    resized to ``(target_h, target_w)``.  This fuses the original CPU-side
-    ``VideoCrop`` + ``VideoResize`` into a single GPU operation.
+    When ``crop_scale > 0`` and ``random_crop`` is False, a center crop is
+    applied.  When ``random_crop`` is True, per-sample random offsets are
+    used instead (matching GR00T's ``VideoCrop`` + ``RandomCrop`` behaviour
+    during training).  Antialiasing is enabled for downsampling.
 
     Args:
         img: Image tensor of shape ``(B, H, W, C)`` (uint8 or float).
@@ -294,24 +295,38 @@ def _gpu_resize_images(
         target_w: Target width.
         crop_scale: Fraction of each dimension to remove (e.g. 0.05 removes
             2.5% from each edge, matching ``VideoCrop(scale=0.95)``).
+        random_crop: If True, apply per-sample random crop (train).
+            If False, apply center crop (eval).
 
     Returns:
         Resized image tensor of shape ``(B, target_h, target_w, C)``,
         same dtype as input.
     """
-    h, w = img.shape[-3], img.shape[-2]
+    B, h, w = img.shape[0], img.shape[-3], img.shape[-2]
 
     if crop_scale > 0 and (h != target_h or w != target_w):
-        margin_h = int(h * crop_scale / 2)
-        margin_w = int(w * crop_scale / 2)
-        img = img[:, margin_h : h - margin_h, margin_w : w - margin_w, :]
+        crop_h = int(h * (1 - crop_scale))
+        crop_w = int(w * (1 - crop_scale))
+        if random_crop:
+            max_top = h - crop_h
+            max_left = w - crop_w
+            tops = torch.randint(0, max_top + 1, (B,), device=img.device)
+            lefts = torch.randint(0, max_left + 1, (B,), device=img.device)
+            crops = []
+            for i in range(B):
+                crops.append(img[i, tops[i] : tops[i] + crop_h, lefts[i] : lefts[i] + crop_w, :])
+            img = torch.stack(crops, dim=0)
+        else:
+            margin_h = (h - crop_h) // 2
+            margin_w = (w - crop_w) // 2
+            img = img[:, margin_h : margin_h + crop_h, margin_w : margin_w + crop_w, :]
 
     if img.shape[-3] == target_h and img.shape[-2] == target_w:
         return img
 
     orig_dtype = img.dtype
     x = img.permute(0, 3, 1, 2).float()
-    x = F.interpolate(x, size=(target_h, target_w), mode="bilinear", align_corners=False)
+    x = F.interpolate(x, size=(target_h, target_w), mode="bilinear", align_corners=False, antialias=True)
     x = x.permute(0, 2, 3, 1)
     if orig_dtype == torch.uint8:
         x = x.clamp(0, 255).to(torch.uint8)
@@ -492,6 +507,13 @@ def _create_generic_env_wrapper(task_id: str) -> type:
                 worker_info: RLinf worker metadata.
             """
             super().__init__(cfg, num_envs, seed_offset, total_num_processes, worker_info)
+            isaaclab_cfg = getattr(cfg, "isaaclab", None)
+            if isaaclab_cfg is not None:
+                from omegaconf import OmegaConf
+
+                self._isaaclab_cfg = OmegaConf.to_container(isaaclab_cfg, resolve=True)
+            else:
+                self._isaaclab_cfg = None
 
         def _make_env_function(self) -> collections.abc.Callable:
             """Create the environment factory function.
@@ -575,7 +597,7 @@ def _create_generic_env_wrapper(task_id: str) -> type:
             policy_obs = obs.get("policy", obs)
             camera_obs = obs.get("camera_images", {})
 
-            cfg = _get_isaaclab_cfg()
+            cfg = self._isaaclab_cfg if self._isaaclab_cfg is not None else _get_isaaclab_cfg()
             task_desc = cfg.get("task_description", "") or self.task_description
             rlinf_obs = {
                 "task_descriptions": [task_desc] * self.num_envs,
@@ -588,12 +610,13 @@ def _create_generic_env_wrapper(task_id: str) -> type:
             target_h = cfg.get("gpu_resize_height", 224)
             target_w = cfg.get("gpu_resize_width", 224)
             crop_scale = cfg.get("gpu_crop_scale", 0.05)
+            random_crop = cfg.get("gpu_crop_random", True)
 
             # main_images: GPU crop+resize then store
             main_key = cfg.get("main_images")
             if main_key and main_key in camera_obs:
                 rlinf_obs["main_images"] = _gpu_resize_images(
-                    camera_obs[main_key], target_h, target_w, crop_scale
+                    camera_obs[main_key], target_h, target_w, crop_scale, random_crop
                 )
 
             # extra_view_images: GPU crop+resize each, then stack to (B, N, H, W, C)
@@ -607,7 +630,7 @@ def _create_generic_env_wrapper(task_id: str) -> type:
                 for k in extra_keys:
                     if k in camera_obs:
                         extra_imgs.append(
-                            _gpu_resize_images(camera_obs[k], target_h, target_w, crop_scale)
+                            _gpu_resize_images(camera_obs[k], target_h, target_w, crop_scale, random_crop)
                         )
                 if extra_imgs:
                     rlinf_obs["extra_view_images"] = torch.stack(extra_imgs, dim=1)
