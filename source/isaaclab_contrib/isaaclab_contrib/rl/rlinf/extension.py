@@ -554,7 +554,6 @@ def _create_generic_env_wrapper(task_id: str) -> type:
                     obs, extras = _original_reset(*args, **kwargs)
                     env.sim.set_setting("/app/player/playSimulations", False)
                     _app.update()
-                    _app.update()
                     env.sim.set_setting("/app/player/playSimulations", True)
                     for sensor in env.scene.sensors.values():
                         sensor.update(dt=0.0, force_recompute=True)
