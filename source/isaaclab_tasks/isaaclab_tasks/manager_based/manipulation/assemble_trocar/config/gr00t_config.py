@@ -27,6 +27,19 @@ from gr00t.experiment.data_config import DATA_CONFIG_MAP, BaseDataConfig
 from gr00t.model.transforms import GR00TTransform
 
 
+class VideoToTensorNoSizeCheck(VideoToTensor):
+    """VideoToTensor that skips resolution validation.
+
+    GPU-side preprocessing (gpu_resize_height/width in YAML) already resizes
+    images to 224x224 before they reach this transform, so the resolution check
+    against model metadata (640x480) would always fail.
+    """
+
+    def check_input(self, data: dict) -> None:
+        # Skip resolution check; GPU preprocessing has already resized the images.
+        pass
+
+
 class IsaacLabDataConfig(BaseDataConfig):
     """Generic GR00T data config for IsaacLab tasks with G1 + Dex3."""
 
@@ -93,19 +106,10 @@ class IsaacLabDataConfig(BaseDataConfig):
         """Define the transform pipeline for processing observations and actions."""
         transforms = [
             # Video transforms
-            VideoToTensor(apply_to=self.video_keys),
-            # Disabled: camera already outputs 224×224 via TiledCameraCfg.
-            # To avoid VideoToTensor size-check errors, either:
-            #   1. Disable input size validation in VideoToTensor, OR
-            #   2. Set modality meta height/width to 224 to match actual input.
-            # Re-enable VideoCrop/VideoResize if camera resolution changes.
-            # VideoCrop(apply_to=self.video_keys, scale=0.95),
-            # VideoResize(
-            #     apply_to=self.video_keys,
-            #     height=224,
-            #     width=224,
-            #     interpolation="linear",
-            # ),
+            # Use no-size-check variant: GPU preprocessing (gpu_resize_height/width)
+            # already outputs 224x224; metadata expects 640x480 so standard
+            # VideoToTensor would raise an AssertionError.
+            VideoToTensorNoSizeCheck(apply_to=self.video_keys),
             VideoColorJitter(
                 apply_to=self.video_keys,
                 brightness=0.3,

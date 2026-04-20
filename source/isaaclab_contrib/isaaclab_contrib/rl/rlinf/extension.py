@@ -515,6 +515,26 @@ def _create_generic_env_wrapper(task_id: str) -> type:
             else:
                 self._isaaclab_cfg = None
 
+            # Track real task success (terminated=True from task_success_termination)
+            self._task_success_ever = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+
+        def _record_metrics(self, step_reward, terminations, infos):
+            """Override to add task_success tracking based on terminated flag."""
+            infos = super()._record_metrics(step_reward, terminations, infos)
+            # task_success_termination sets terminated=True (time_out=False)
+            self._task_success_ever = self._task_success_ever | terminations.bool()
+            infos["episode"]["task_success"] = self._task_success_ever.clone()
+            return infos
+
+        def _reset_metrics(self, env_idx=None):
+            super()._reset_metrics(env_idx)
+            if env_idx is not None:
+                mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+                mask[env_idx] = True
+                self._task_success_ever[mask] = False
+            else:
+                self._task_success_ever[:] = False
+
         def _make_env_function(self) -> collections.abc.Callable:
             """Create the environment factory function.
 

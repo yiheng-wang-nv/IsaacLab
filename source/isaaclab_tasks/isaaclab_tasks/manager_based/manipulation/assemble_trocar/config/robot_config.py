@@ -35,7 +35,7 @@ from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 from isaaclab.utils import configclass
 
-HEALTHCARE_S3 = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/Healthcare/0.5.0/132c82d"
+HEALTHCARE_S3 = "/localhome/local-vennw/models/healthcare_assets/0.5.0/132c82d"
 
 # Default joint positions for the supported setup (G1 29DOF + Dex3).
 DEFAULT_JOINT_POS: dict[str, float] = {

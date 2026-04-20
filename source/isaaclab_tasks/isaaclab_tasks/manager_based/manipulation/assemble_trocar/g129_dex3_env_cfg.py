@@ -90,7 +90,7 @@ offset_dict = {
     "right_elbow_joint": -0.3,
 }
 
-HEALTHCARE_S3 = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/Healthcare/0.5.0/132c82d"
+HEALTHCARE_S3 = "/localhome/local-vennw/models/healthcare_assets/0.5.0/132c82d"
 USD_ROOT = f"{HEALTHCARE_S3}/Props/LightWheel"
 
 
@@ -245,7 +245,7 @@ class TerminationsCfg:
         time_out=False,  # This is a success termination, not a failure
         params={
             "print_log": False,
-            "success_stage": 1,
+            "success_stage": 4,
         },
     )
     object_drop = DoneTerm(
