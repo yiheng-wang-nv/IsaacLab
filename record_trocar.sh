@@ -8,7 +8,8 @@ CONDA_DIR="/localhome/local-vennw/miniconda3"
 ISAACLAB_DIR="/localhome/local-vennw/code/IsaacLab"
 ISAACSIM_DIR="/localhome/local-vennw/isaac-sim-standalone-6.0.0-rc.22"
 MODEL_PATH="/localhome/local-vennw/models/orca_rlinf_weights/rlinf/actor/model_state_dict"
-OUTPUT_DIR="/localhome/local-vennw/data/trocar_recorded"
+OUTPUT_DIR="/localhome/local-vennw/data/trocar_recorded_1_steps"
+OPEN_LOOP_STEPS=1
 
 # ---- 激活 conda 环境 ----
 source "$CONDA_DIR/etc/profile.d/conda.sh"
@@ -33,7 +34,8 @@ cd "$ISAACLAB_DIR"
 ./isaaclab.sh -p scripts/tools/record_trocar_episodes.py \
   --model_path "$MODEL_PATH" \
   --output_dir "$OUTPUT_DIR" \
-  --num_episodes 1 \
+  --num_episodes 100 \
   --max_steps 300 \
   --denoising_steps 4 \
+  --open_loop_steps "$OPEN_LOOP_STEPS" \
   "$@"

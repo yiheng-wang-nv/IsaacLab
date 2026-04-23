@@ -2,9 +2,9 @@
 # ============================================================
 # 多 GPU 并行录制 Trocar episodes
 # 用法:
-#   bash parallel_record.sh [总episode数] [GPU列表(逗号分隔)] [skip_first_n] [rand_light] [post_process]
+#   bash parallel_record.sh [总episode数] [GPU列表(逗号分隔)] [skip_first_n] [rand_light] [post_process] [output_dir] [open_loop_steps] [额外record参数...]
 # 例:
-#   bash parallel_record.sh 30 1,2,3,5 3 1 both   # 30条,GPU 1,2,3,5,光照随机,同时生成原始+成功+切分
+#   bash parallel_record.sh 30 1,2,3,5 3 1 both /tmp/out 8 --model_path /path/to/ckpt
 # post_process: none / success / split / both (default: both = success + split-by-stage)
 # ============================================================
 set -e
@@ -17,6 +17,8 @@ SKIP_FIRST_N=${3:-3}
 RANDOMIZE_LIGHTING=${4:-0}
 POST_PROCESS=${5:-both}  # none | success | split | both
 BASE_OUTPUT_DIR=${6:-"/localhome/local-vennw/data/trocar_parallel"}
+OPEN_LOOP_STEPS=${7:-1}
+EXTRA_ARGS=("${@:8}")
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Parse GPU list into array
@@ -32,6 +34,7 @@ echo "Parallel recording: ${TOTAL_EPISODES} episodes on ${NUM_GPUS} GPUs"
 echo "  GPUs: ${GPU_LIST}"
 echo "  Per GPU: ${PER_GPU} episodes (+ ${REMAINDER} extra on first GPUs)"
 echo "  Skip first N frames: ${SKIP_FIRST_N}"
+echo "  Open-loop steps: ${OPEN_LOOP_STEPS}"
 echo "  Output: ${BASE_OUTPUT_DIR}"
 echo "============================================================"
 
@@ -59,7 +62,6 @@ for IDX in "${!GPU_ARRAY[@]}"; do
     SEED=$((42 + GPU_ID * 1000))
     # Don't use CUDA_VISIBLE_DEVICES — Isaac Sim's renderer ignores it and falls back to GPU 0.
     # Pass the physical GPU id via --device so AppLauncher sets active_gpu/physics_gpu correctly.
-    DISPLAY= MESA_GL_VERSION_OVERRIDE=4.6 \
     LIGHT_FLAG=""
     if [ "$RANDOMIZE_LIGHTING" = "1" ]; then
         LIGHT_FLAG="--randomize_lighting"
@@ -72,7 +74,9 @@ for IDX in "${!GPU_ARRAY[@]}"; do
         --skip_first_n $SKIP_FIRST_N \
         --device cuda:$GPU_ID \
         --model_device cuda:$GPU_ID \
+        --open_loop_steps $OPEN_LOOP_STEPS \
         $LIGHT_FLAG \
+        "${EXTRA_ARGS[@]}" \
         > "$LOG_FILE" 2>&1 &
 
     PIDS+=($!)

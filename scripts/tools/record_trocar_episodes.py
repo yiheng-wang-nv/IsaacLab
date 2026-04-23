@@ -24,12 +24,23 @@ parser.add_argument("--output_dir", type=str, required=True, help="Output direct
 parser.add_argument("--num_episodes", type=int, default=10, help="Number of episodes to record.")
 parser.add_argument("--max_steps", type=int, default=256, help="Max steps per episode.")
 parser.add_argument("--denoising_steps", type=int, default=4, help="GR00T denoising steps.")
+parser.add_argument(
+    "--open_loop_steps",
+    type=int,
+    default=None,
+    help="Number of action chunk steps to execute before running GR00T inference again."
+    " Defaults to 8 for --use_gr00t_policy and 1 for RLinf checkpoints.",
+)
 parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel envs for recording.")
 parser.add_argument("--model_device", type=str, default="cuda:0", help="Device for model inference.")
 parser.add_argument("--seed", type=int, default=None, help="Random seed for env reproducibility.")
 parser.add_argument("--skip_first_n", type=int, default=3, help="Skip recording the first N frames (physics settling).")
 parser.add_argument("--skip_last_n", type=int, default=1, help="Skip recording the last N frames.")
 parser.add_argument("--randomize_lighting", action="store_true", default=False, help="Randomize lighting per episode (surgical room range).")
+parser.add_argument("--use_gr00t_policy", action="store_true", default=False,
+                    help="Use Gr00tPolicy directly (SFT checkpoint) instead of GR00T_N1_5_ForRLActionPrediction (RLinf).")
+parser.add_argument("--no_mask", action="store_true", default=False,
+                    help="Skip segmentation mask recording (faster; only saves RGB videos + parquet).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -284,11 +295,13 @@ def create_env():
     """Create IsaacLab env with instance segmentation cameras."""
     env_cfg = parse_env_cfg(TASK_ID, device=args.model_device, num_envs=args.num_envs)
 
-    # Use instance_id_segmentation_fast — each prim mesh gets a unique ID
     for cam_name in CAMERA_KEYS:
         cam_cfg = getattr(env_cfg.scene, cam_name)
-        cam_cfg.data_types = ["rgb", "instance_id_segmentation_fast"]
-        cam_cfg.colorize_instance_id_segmentation = False
+        if args.no_mask:
+            cam_cfg.data_types = ["rgb"]
+        else:
+            cam_cfg.data_types = ["rgb", "instance_id_segmentation_fast"]
+            cam_cfg.colorize_instance_id_segmentation = False
 
     # Keep terminations (success / drop / timeout) so episodes end naturally
     # Only disable recorders
@@ -375,6 +388,93 @@ def wrap_obs_rlinf(obs: dict, num_envs: int) -> dict:
             rlinf_obs["states"] = torch.cat(state_parts, dim=-1)
 
     return rlinf_obs
+
+
+INV_PERM = np.argsort(PERM_TO_REF)  # ref order → internal order
+
+
+def wrap_obs_gr00t(env) -> dict:
+    """Build observation dict for Gr00tPolicy.get_action() (single env only).
+
+    Returns raw camera images and joint states in the format expected by
+    UnitreeG1SimDataConfig — the transform pipeline inside Gr00tPolicy
+    handles resizing, sin/cos encoding, and normalization.
+    """
+    # Camera images: (H, W, 3) uint8, add batch dim → (1, H, W, 3)
+    cam_map = {
+        "front_camera":       "video.room_view",
+        "left_wrist_camera":  "video.left_wrist_view",
+        "right_wrist_camera": "video.right_wrist_view",
+    }
+    obs_dict = {}
+    for cam_key, gr00t_key in cam_map.items():
+        img = get_camera_rgb_batch(env, cam_key)[0]       # (H, W, 3)
+        obs_dict[gr00t_key] = img[np.newaxis]             # (1, H, W, 3)
+
+    # Joint states in ref order (same as training data)
+    states_internal = get_joint_states_batch(env)[0]      # (28,) internal order
+    states_ref = states_internal[PERM_TO_REF]             # (28,) ref order
+    obs_dict["state.left_arm"]   = states_ref[0:7][np.newaxis]   # (1, 7)
+    obs_dict["state.right_arm"]  = states_ref[7:14][np.newaxis]  # (1, 7)
+    obs_dict["state.left_hand"]  = states_ref[14:21][np.newaxis] # (1, 7)
+    obs_dict["state.right_hand"] = states_ref[21:28][np.newaxis] # (1, 7)
+
+    obs_dict["annotation.human.task_description"] = [TASK_DESCRIPTION]
+    return obs_dict
+
+
+def gr00t_action_chunk_to_isaaclab(action_dict: dict) -> np.ndarray:
+    """Convert Gr00tPolicy action dict → Isaac Lab action chunk.
+
+    Concatenates the four action keys in ref order, applies the inverse
+    permutation to recover internal joint order, then prepends 15 zero-padded
+    body joints that the env action space requires.
+
+    Returns:
+        Array with shape ``(T, 43)`` where ``T`` is the available action horizon.
+    """
+    parts = []
+    for key in ["action.left_arm", "action.right_arm", "action.left_hand", "action.right_hand"]:
+        value = np.asarray(action_dict[key], dtype=np.float32)
+        if value.ndim == 3:
+            value = value[0]
+        elif value.ndim == 1:
+            value = value[np.newaxis, :]
+        parts.append(value)
+
+    chunk_len = min(part.shape[0] for part in parts)
+    action_chunk = []
+    for step_idx in range(chunk_len):
+        action_ref = np.concatenate([part[step_idx] for part in parts], axis=-1)
+        action_internal = action_ref[INV_PERM]
+        action_43 = np.concatenate(
+            [np.zeros(ACTION_PREFIX_PAD, dtype=np.float32), action_internal],
+            axis=0,
+        )
+        action_chunk.append(action_43.astype(np.float32, copy=False))
+    return np.stack(action_chunk, axis=0)
+
+
+def rlinf_action_chunk_to_isaaclab(raw_action: np.ndarray | torch.Tensor) -> np.ndarray:
+    """Convert RLinf GR00T action output into a batch action chunk.
+
+    Args:
+        raw_action: RLinf action output with shape ``(B, T, 43)`` or ``(B, 43)``.
+
+    Returns:
+        Array with shape ``(B, T, 43)``.
+    """
+    if isinstance(raw_action, torch.Tensor):
+        raw_action = raw_action.detach().cpu().numpy()
+    else:
+        raw_action = np.asarray(raw_action)
+
+    if raw_action.ndim == 2:
+        raw_action = raw_action[:, np.newaxis, :]
+    if raw_action.ndim != 3:
+        raise ValueError(f"Expected RLinf action chunk with 2 or 3 dims, got shape {raw_action.shape}.")
+
+    return raw_action.astype(np.float32, copy=False)
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +579,8 @@ def save_episode_data(
 
     # ---- masks/chunk-000/<camera_key>/episode_XXXXXX_masks.npz ----
     for cam_name, cam_masks in masks.items():
+        if not cam_masks:
+            continue
         lerobot_name = CAMERA_LEROBOT_NAMES[cam_name]
         mask_dir = output_dir / "masks" / chunk_dir / lerobot_name
         mask_dir.mkdir(parents=True, exist_ok=True)
@@ -660,7 +762,6 @@ def main():
     env = create_env()
 
     print(f"[INFO] Loading GR00T model from {args.model_path}...")
-    # Add config dir to path so gr00t_config can be found
     config_dir = str(
         Path(__file__).resolve().parents[2]
         / "source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/assemble_trocar/config"
@@ -668,75 +769,94 @@ def main():
     if config_dir not in sys.path:
         sys.path.insert(0, config_dir)
 
-    # Load model the same way RLinf does — using GR00T_N1_5_ForRLActionPrediction
-    # First register obs/action converters (required by the model)
-    # Set config path BEFORE importing extension functions (they read from this env var)
-    yaml_path = str(Path(config_dir) / "isaaclab_ppo_gr00t_assemble_trocar.yaml")
-    os.environ["RLINF_CONFIG_FILE"] = yaml_path
-    os.environ.setdefault("RLINF_EXT_MODULE", "isaaclab_contrib.rl.rlinf.extension")
+    if args.use_gr00t_policy:
+        # ---- SFT model: Gr00tPolicy (no RLinf) ----
+        # Import UnitreeG1SimDataConfig from Isaac-GR00T root (not the local isaaclab config)
+        isaac_gr00t_dir = str(Path("/localhome/local-vennw/code/cosmos_gr00t/Isaac-GR00T"))
+        if isaac_gr00t_dir not in sys.path:
+            sys.path.insert(0, isaac_gr00t_dir)
+        from gr00t.model.policy import Gr00tPolicy
+        # Import UnitreeG1SimDataConfig without shadowing IsaacLabDataConfig
+        import importlib.util
+        _spec = importlib.util.spec_from_file_location(
+            "gr00t_config_sft",
+            str(Path(isaac_gr00t_dir) / "gr00t_config.py"),
+        )
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        data_config = _mod.UnitreeG1SimInferDataConfig()
+        modality_config = data_config.modality_config()
+        modality_transform = data_config.transform()
 
-    from isaaclab_contrib.rl.rlinf.extension import _register_gr00t_converters, _patch_embodiment_tags
-    isaaclab_cfg = {
-        "obs_converter_type": "dex3",
-        "embodiment_tag": "new_embodiment",
-        "embodiment_tag_id": 31,
-        "task_description": TASK_DESCRIPTION,
-        "gr00t_mapping": {
-            "video": {
-                "main_images": "video.room_view",
-                "extra_view_images": ["video.left_wrist_view", "video.right_wrist_view"],
+        policy = Gr00tPolicy(
+            model_path=args.model_path,
+            modality_config=modality_config,
+            modality_transform=modality_transform,
+            embodiment_tag="new_embodiment",
+            denoising_steps=args.denoising_steps,
+            device=args.model_device,
+        )
+        print("[INFO] Using Gr00tPolicy (SFT mode)")
+    else:
+        # ---- RLinf model: GR00T_N1_5_ForRLActionPrediction ----
+        yaml_path = str(Path(config_dir) / "isaaclab_ppo_gr00t_assemble_trocar.yaml")
+        os.environ["RLINF_CONFIG_FILE"] = yaml_path
+        os.environ.setdefault("RLINF_EXT_MODULE", "isaaclab_contrib.rl.rlinf.extension")
+
+        from isaaclab_contrib.rl.rlinf.extension import _register_gr00t_converters, _patch_embodiment_tags
+        isaaclab_cfg = {
+            "obs_converter_type": "dex3",
+            "embodiment_tag": "new_embodiment",
+            "embodiment_tag_id": 31,
+            "task_description": TASK_DESCRIPTION,
+            "gr00t_mapping": {
+                "video": {
+                    "main_images": "video.room_view",
+                    "extra_view_images": ["video.left_wrist_view", "video.right_wrist_view"],
+                },
+                "state": [
+                    {"gr00t_key": "state.left_arm", "slice": [0, 7]},
+                    {"gr00t_key": "state.right_arm", "slice": [7, 14]},
+                    {"gr00t_key": "state.left_hand", "slice": [14, 21]},
+                    {"gr00t_key": "state.right_hand", "slice": [21, 28]},
+                ],
             },
-            "state": [
-                {"gr00t_key": "state.left_arm", "slice": [0, 7]},
-                {"gr00t_key": "state.right_arm", "slice": [7, 14]},
-                {"gr00t_key": "state.left_hand", "slice": [14, 21]},
-                {"gr00t_key": "state.right_hand", "slice": [21, 28]},
-            ],
-        },
-        "action_mapping": {"prefix_pad": 15, "suffix_pad": 0},
-    }
-    _register_gr00t_converters(isaaclab_cfg)
-    _patch_embodiment_tags(isaaclab_cfg)
+            "action_mapping": {"prefix_pad": 15, "suffix_pad": 0},
+        }
+        _register_gr00t_converters(isaaclab_cfg)
+        _patch_embodiment_tags(isaaclab_cfg)
 
-    from gr00t_config import IsaacLabDataConfig
-    data_config = IsaacLabDataConfig()
-    modality_config = data_config.modality_config()
-    modality_transform = data_config.transform()
+        from gr00t_config import IsaacLabDataConfig
+        data_config = IsaacLabDataConfig()
+        modality_config = data_config.modality_config()
+        modality_transform = data_config.transform()
 
-    from omegaconf import OmegaConf
-    rl_head_config = OmegaConf.create({
-        "joint_logprob": False,
-        "noise_method": "flow_sde",
-        "ignore_last": False,
-        "safe_get_logprob": False,
-        "noise_anneal": False,
-        "noise_params": [0.7, 0.3, 400],
-        "noise_level": 0.3,
-        "add_value_head": True,  # must be True to match checkpoint structure
-        "chunk_critic_input": False,
-        "detach_critic_input": True,
-        "disable_dropout": True,
-        "use_vlm_value": False,
-        "value_vlm_mode": "mean_token",
-        "padding_value": 850,
-    })
+        from omegaconf import OmegaConf
+        rl_head_config = OmegaConf.create({
+            "joint_logprob": False, "noise_method": "flow_sde", "ignore_last": False,
+            "safe_get_logprob": False, "noise_anneal": False, "noise_params": [0.7, 0.3, 400],
+            "noise_level": 0.3, "add_value_head": True, "chunk_critic_input": False,
+            "detach_critic_input": True, "disable_dropout": True,
+            "use_vlm_value": False, "value_vlm_mode": "mean_token", "padding_value": 850,
+        })
 
-    policy = GR00T_N1_5_ForRLActionPrediction.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.bfloat16,
-        embodiment_tag="new_embodiment",
-        modality_config=modality_config,
-        modality_transform=modality_transform,
-        denoising_steps=args.denoising_steps,
-        output_action_chunks=1,
-        obs_converter_type="dex3",
-        tune_visual=False,
-        tune_llm=False,
-        rl_head_config=rl_head_config,
-    )
-    policy.to(torch.bfloat16)
-    policy.eval()
-    policy.to(args.model_device)
+        policy = GR00T_N1_5_ForRLActionPrediction.from_pretrained(
+            args.model_path,
+            torch_dtype=torch.bfloat16,
+            embodiment_tag="new_embodiment",
+            modality_config=modality_config,
+            modality_transform=modality_transform,
+            denoising_steps=args.denoising_steps,
+            output_action_chunks=max(args.open_loop_steps or 1, 1),
+            obs_converter_type="dex3",
+            tune_visual=False,
+            tune_llm=False,
+            rl_head_config=rl_head_config,
+        )
+        policy.to(torch.bfloat16)
+        policy.eval()
+        policy.to(args.model_device)
+        print("[INFO] Using GR00T_N1_5_ForRLActionPrediction (RLinf mode)")
 
     # Get joint names for metadata
     joint_names = [
@@ -753,29 +873,27 @@ def main():
     episode_lengths = []
     episode_results = []
 
-    # Build instance_id → category mapping from first camera's info
-    # (mapping is the same for all cameras)
-    print("[INFO] Building instance-to-category mapping...")
-    first_sensor = env.scene.sensors[CAMERA_KEYS[0]]
-    cam_info = first_sensor.data.info
-    # info can be a list (per env) or dict
-    if isinstance(cam_info, list):
-        info_dict = cam_info[0] if cam_info else {}
-    else:
-        info_dict = cam_info
-    # info_dict might be stored as string repr, parse if needed
-    if isinstance(info_dict, str):
-        import ast
-        info_dict = ast.literal_eval(info_dict)
-    inst_to_cat = _build_instance_to_category(info_dict)
-
-    # Save category mapping for reference
-    with open(output_dir / "category_mapping.json", "w") as f:
-        json.dump({"categories": CATEGORY_NAMES, "instance_to_category": {str(k): v for k, v in inst_to_cat.items()}}, f, indent=2)
-    print(f"  Mapped {len(inst_to_cat)} instance IDs to {len(set(inst_to_cat.values()))} categories")
+    inst_to_cat = {}
+    if not args.no_mask:
+        print("[INFO] Building instance-to-category mapping...")
+        first_sensor = env.scene.sensors[CAMERA_KEYS[0]]
+        cam_info = first_sensor.data.info
+        if isinstance(cam_info, list):
+            info_dict = cam_info[0] if cam_info else {}
+        else:
+            info_dict = cam_info
+        if isinstance(info_dict, str):
+            import ast
+            info_dict = ast.literal_eval(info_dict)
+        inst_to_cat = _build_instance_to_category(info_dict)
+        with open(output_dir / "category_mapping.json", "w") as f:
+            json.dump({"categories": CATEGORY_NAMES, "instance_to_category": {str(k): v for k, v in inst_to_cat.items()}}, f, indent=2)
+        print(f"  Mapped {len(inst_to_cat)} instance IDs to {len(set(inst_to_cat.values()))} categories")
 
     num_envs = args.num_envs
     total_needed = args.num_episodes
+    open_loop_steps = args.open_loop_steps if args.open_loop_steps is not None else (8 if args.use_gr00t_policy else 1)
+    cached_policy_actions: list[np.ndarray] = []
 
     # Per-env episode buffers
     def _new_buffer():
@@ -788,6 +906,11 @@ def main():
 
     print(f"[INFO] Recording {total_needed} episodes with {num_envs} parallel envs "
           f"(max {args.max_steps} steps each)...")
+    policy_mode = "Gr00tPolicy" if args.use_gr00t_policy else "RLinf GR00T"
+    print(f"[INFO] {policy_mode} open-loop steps per inference: {open_loop_steps}")
+    if args.use_gr00t_policy:
+        if num_envs != 1:
+            print("[WARN] --use_gr00t_policy currently builds observations from env 0 and tiles the action to all envs.")
 
     # Per-episode lighting RNG (use args.seed as base)
     light_rng_base = args.seed if args.seed is not None else 0
@@ -797,6 +920,7 @@ def main():
 
     with torch.inference_mode():
         obs, _ = env.reset(seed=args.seed)
+        cached_policy_actions = []
         light_info = None
         if args.randomize_lighting:
             light_info = _randomize_surgical_lighting(env, np.random.RandomState(light_rng_base))
@@ -829,12 +953,30 @@ def main():
 
         while len(episode_results) < total_needed:
             # Inference first (using current obs from reset or previous step)
-            rlinf_obs = wrap_obs_rlinf(obs, num_envs)
-            with torch.no_grad():
-                raw_action, _ = policy.predict_action_batch(rlinf_obs, mode="eval")
-            if isinstance(raw_action, np.ndarray):
-                if raw_action.ndim == 3:
-                    raw_action = raw_action[:, 0, :]  # (B, 43)
+            if args.use_gr00t_policy:
+                if not cached_policy_actions:
+                    gr00t_obs = wrap_obs_gr00t(env)
+                    with torch.no_grad():
+                        action_dict = policy.get_action(gr00t_obs)
+                    action_chunk = gr00t_action_chunk_to_isaaclab(action_dict)
+                    if len(action_chunk) == 0:
+                        raise RuntimeError("GR00T policy returned an empty action chunk.")
+                    cached_policy_actions = [
+                        action.copy() for action in action_chunk[: max(open_loop_steps, 1)]
+                    ]
+                raw_action = cached_policy_actions.pop(0)[np.newaxis, :]  # (1, 43)
+                raw_action = np.tile(raw_action, (num_envs, 1))          # (B, 43)
+            else:
+                if not cached_policy_actions:
+                    rlinf_obs = wrap_obs_rlinf(obs, num_envs)
+                    with torch.no_grad():
+                        raw_action_chunk, _ = policy.predict_action_batch(rlinf_obs, mode="eval")
+                    action_chunk = rlinf_action_chunk_to_isaaclab(raw_action_chunk)
+                    cached_policy_actions = [
+                        action_chunk[:, step_idx, :].copy()
+                        for step_idx in range(min(action_chunk.shape[1], max(open_loop_steps, 1)))
+                    ]
+                raw_action = cached_policy_actions.pop(0)  # (B, 43)
             action_tensor = torch.tensor(raw_action, dtype=torch.float32, device=env.device)
 
             # Step all envs — after this, camera images are fresh
@@ -865,7 +1007,8 @@ def main():
             seg_batch = {}
             for cam_name in CAMERA_KEYS:
                 rgb_batch[cam_name] = get_camera_rgb_batch(env, cam_name)
-                seg_batch[cam_name] = get_camera_segmentation_batch(env, cam_name, inst_to_cat)
+                if not args.no_mask:
+                    seg_batch[cam_name] = get_camera_segmentation_batch(env, cam_name, inst_to_cat)
 
             # Store per-env data
             for i in range(num_envs):
@@ -877,7 +1020,8 @@ def main():
                 buf["stages"].append(int(stage_batch[i]))
                 for cam_name in CAMERA_KEYS:
                     buf["frames"][cam_name].append(rgb_batch[cam_name][i])
-                    buf["masks"][cam_name].append(seg_batch[cam_name][i])
+                    if not args.no_mask:
+                        buf["masks"][cam_name].append(seg_batch[cam_name][i])
                 action_28 = action_tensor[i, ACTION_PREFIX_PAD:ACTION_PREFIX_PAD + 28].cpu().numpy().astype(np.float32)
                 buffers[i]["actions"].append(action_28)
                 buffers[i]["step_count"] += 1
@@ -911,8 +1055,11 @@ def main():
 
                 status = "SUCCESS" if is_success else "FAIL"
                 reason = "success" if is_success else ("timeout" if ep_length >= args.max_steps else "terminated")
+                n_done = len(episode_results)
+                n_success = sum(1 for r in episode_results if r["success"])
+                sr = n_success / n_done * 100
                 print(f"  Episode {ep_idx}: {ep_length} steps — {status} ({reason})  "
-                      f"[{len(episode_results)}/{total_needed}]")
+                      f"[{n_done}/{total_needed}]  success rate: {n_success}/{n_done} ({sr:.1f}%)")
 
                 save_episode_data(output_dir, ep_idx, buf["timestamps"], buf["states"],
                                   buf["actions"], buf["frames"], buf["masks"],
@@ -933,6 +1080,7 @@ def main():
 
                 # Reset buffer and assign next episode
                 buffers[i] = _new_buffer()
+                cached_policy_actions = []
                 if next_ep_idx < total_needed:
                     env_ep_idx[i] = next_ep_idx
                     next_ep_idx += 1
