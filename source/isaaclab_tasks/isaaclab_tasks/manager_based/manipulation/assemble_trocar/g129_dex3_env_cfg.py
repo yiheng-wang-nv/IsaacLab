@@ -117,7 +117,7 @@ class AssembleTrocarSceneCfg(InteractiveSceneCfg):
     trocar_1 = RigidObjectCfg(
         prim_path="/World/envs/env_.*/trocar_1",
         spawn=UsdFileCfg(
-            usd_path=f"{USD_ROOT}/Assets/Trocar002/Trocar002-xform-wo.usd",
+            usd_path="/localhome/local-vennw/code/Trocar004_test.usd",
             collision_props=sim_utils.CollisionPropertiesCfg(
                 collision_enabled=True,
                 contact_offset=0.001,
@@ -133,11 +133,7 @@ class AssembleTrocarSceneCfg(InteractiveSceneCfg):
     trocar_2 = RigidObjectCfg(
         prim_path="/World/envs/env_.*/trocar_2",
         spawn=UsdFileCfg(
-            usd_path=(
-                f"{USD_ROOT}/Assets/"
-                "DisposableLaparoscopicPunctureDevice001/"
-                "DisposableLaparoscopicPunctureDevice005-xform.usd"
-            ),
+            usd_path="/localhome/local-vennw/code/DisposableLaparoscopicPunctureDevice006_test.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 rigid_body_enabled=True,
                 disable_gravity=False,

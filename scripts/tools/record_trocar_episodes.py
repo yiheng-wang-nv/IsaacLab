@@ -37,10 +37,43 @@ parser.add_argument("--seed", type=int, default=None, help="Random seed for env 
 parser.add_argument("--skip_first_n", type=int, default=3, help="Skip recording the first N frames (physics settling).")
 parser.add_argument("--skip_last_n", type=int, default=1, help="Skip recording the last N frames.")
 parser.add_argument("--randomize_lighting", action="store_true", default=False, help="Randomize lighting per episode (surgical room range).")
+parser.add_argument("--tray_yaw_min_deg", type=float, default=0.0, help="Minimum reset tray yaw randomization [deg].")
+parser.add_argument("--tray_yaw_max_deg", type=float, default=10.0, help="Maximum reset tray yaw randomization [deg].")
 parser.add_argument("--use_gr00t_policy", action="store_true", default=False,
                     help="Use Gr00tPolicy directly (SFT checkpoint) instead of GR00T_N1_5_ForRLActionPrediction (RLinf).")
 parser.add_argument("--no_mask", action="store_true", default=False,
                     help="Skip segmentation mask recording (faster; only saves RGB videos + parquet).")
+parser.add_argument(
+    "--fixed_initial_state_dataset",
+    type=str,
+    default=None,
+    help="Optional LeRobot dataset directory. If set, episode/frame observation.state is used as a fixed start pose.",
+)
+parser.add_argument("--fixed_initial_state_episode", type=int, default=0, help="Episode index for fixed start pose.")
+parser.add_argument("--fixed_initial_state_frame", type=int, default=0, help="Frame index for fixed start pose.")
+parser.add_argument(
+    "--fixed_initial_state_steps",
+    type=int,
+    default=30,
+    help="Number of env steps to command the fixed start pose after every reset.",
+)
+parser.add_argument(
+    "--fixed_initial_state_mode",
+    type=str,
+    choices=("command", "teleport", "teleport_settle"),
+    default="command",
+    help=(
+        "How to reach the fixed start pose. 'command' sends joint-position actions until tolerance; "
+        "'teleport' writes the target robot joints to sim, holds for fixed_initial_state_steps, then writes again; "
+        "'teleport_settle' writes once, then holds for fixed_initial_state_steps without a final write."
+    ),
+)
+parser.add_argument(
+    "--fixed_initial_state_tolerance",
+    type=float,
+    default=0.035,
+    help="Stop fixed-start warm-up early when max 28-DoF state error is below this value.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -91,16 +124,9 @@ CAMERA_LEROBOT_NAMES = {
     "right_wrist_camera": "observation.images.cam_right_wrist",
 }
 
-# Permutation to convert our internal joint order → reference dataset order
-# Our order (positions 14-27): left[Index0,Middle0,Thumb0,Index1,Middle1,Thumb1,Thumb2],
-#                              right[Index0,Middle0,Thumb0,Index1,Middle1,Thumb1,Thumb2]
-# Ref order (positions 14-27): left[Thumb0,Thumb1,Thumb2,Middle0,Middle1,Index0,Index1],
-#                              right[Thumb0,Thumb1,Thumb2,Index0,Index1,Middle0,Middle1]
-PERM_TO_REF = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,  # arms (unchanged)
-    16, 19, 20, 15, 18, 14, 17,  # left hand
-    23, 26, 27, 21, 24, 22, 25,  # right hand
-]
+# Current env action order after the 15-DoF prefix already matches reference order:
+# left arm, right arm, left hand thumb/middle/index, right hand thumb/middle/index.
+PERM_TO_REF = list(range(28))
 
 # Reference joint names (kCamelCase)
 REF_JOINT_NAMES = [
@@ -117,7 +143,7 @@ REF_JOINT_NAMES = [
 ]
 
 # Joint indices for state extraction (from observations.py)
-BODY_JOINT_INDICES = [0, 3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36]
+BODY_JOINT_INDICES = [0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18, 2, 5, 8, 11, 15, 19, 21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28]
 DEX3_JOINT_INDICES = [31, 37, 41, 30, 36, 29, 35, 34, 40, 42, 33, 39, 32, 38]
 
 # State slicing for GR00T: robot_joint_state[15:29] (14 shoulder) + dex3 (14)
@@ -125,6 +151,7 @@ SHOULDER_SLICE = (15, 29)  # from the 29-element body joint pos, take indices 15
 
 # Action mapping
 ACTION_PREFIX_PAD = 15  # zero-pad for uncontrolled body joints
+ROBOT_ACTION_DIM = ACTION_PREFIX_PAD + len(PERM_TO_REF)
 
 
 # ---------------------------------------------------------------------------
@@ -176,16 +203,16 @@ def build_modality_transform():
 # Environment creation
 # ---------------------------------------------------------------------------
 # Merged category mapping: instance prim path pattern → category ID
-# 0=background, 1=robot, 2=trocar_1, 3=trocar_2, 4=tray, 5=cart, 6=instrument_trolley, 7=ground
+# 0=background, 1=ground, 2=robot, 3=trocar_1, 4=trocar_2, 5=tray, 6=cart, 7=instrument_trolley
 CATEGORY_NAMES = {
     0: "background",
-    1: "robot",
-    2: "trocar_1",
-    3: "trocar_2",
-    4: "tray",
-    5: "cart",
-    6: "instrument_trolley",
-    7: "ground",
+    1: "ground",
+    2: "robot",
+    3: "trocar_1",
+    4: "trocar_2",
+    5: "tray",
+    6: "cart",
+    7: "instrument_trolley",
 }
 
 
@@ -218,10 +245,65 @@ def _capture_episode_init_state(env) -> dict:
         p = wp.to_torch(env.scene["trocar_2"].data.root_state_w)[0]
         info["trocar_2_pos"] = p[0:3].cpu().numpy().tolist()
         info["trocar_2_quat"] = p[3:7].cpu().numpy().tolist()
+    if "robot" in env.scene.keys():
+        robot_state_internal = get_joint_states_batch(env)[0]
+        robot_state_ref = robot_state_internal[PERM_TO_REF]
+        info["robot_state_ref"] = robot_state_ref.tolist()
+        info["robot_left_hand_ref"] = robot_state_ref[14:21].tolist()
+        info["robot_right_hand_ref"] = robot_state_ref[21:28].tolist()
     return info
 
 
-def _randomize_surgical_lighting(env, rng: np.random.RandomState) -> dict:
+def _capture_surgical_lighting_baseline(env) -> list[dict]:
+    """Capture original surgical-room light attributes used as randomization baseline.
+
+    Args:
+        env: Isaac Lab environment containing the USD stage.
+
+    Returns:
+        A list of light attribute records. Intensities are in USD light intensity units.
+    """
+    baseline = []
+    stage = env.sim.stage
+    for prim in stage.Traverse():
+        tname = str(prim.GetTypeName())
+        if "Light" not in tname:
+            continue
+
+        intensity_attr_name = None
+        intensity = None
+        for attr_name in ["inputs:intensity", "intensity"]:
+            attr = prim.GetAttribute(attr_name)
+            if attr.IsValid() and attr.Get() is not None:
+                intensity_attr_name = attr_name
+                intensity = float(attr.Get())
+                break
+
+        color_attr_name = None
+        color = None
+        for attr_name in ["inputs:color", "color"]:
+            attr = prim.GetAttribute(attr_name)
+            if attr.IsValid() and attr.Get() is not None:
+                color_attr_name = attr_name
+                color_value = attr.Get()
+                color = [float(color_value[0]), float(color_value[1]), float(color_value[2])]
+                break
+
+        if intensity_attr_name is None and color_attr_name is None:
+            continue
+
+        baseline.append({
+            "path": str(prim.GetPath()),
+            "intensity_attr": intensity_attr_name,
+            "intensity": intensity,
+            "color_attr": color_attr_name,
+            "color": color,
+        })
+
+    return baseline
+
+
+def _randomize_surgical_lighting(env, rng: np.random.RandomState, lighting_baseline: list[dict]) -> dict:
     """Randomize ALL lights within realistic surgical-room range.
 
     Real OR lighting is highly standardized (4000-5000K neutral-cool white,
@@ -229,7 +311,13 @@ def _randomize_surgical_lighting(env, rng: np.random.RandomState) -> dict:
       - Intensity: ±30% variation (shadow/position differences)
       - Color temperature: very subtle cool-to-neutral shift
 
-    Returns dict with the applied params (for replay/logging).
+    Args:
+        env: Isaac Lab environment containing the USD stage.
+        rng: Numpy random state for deterministic per-episode sampling.
+        lighting_baseline: Original light attributes captured before randomization.
+
+    Returns:
+        Dict with the applied params for replay/logging.
     """
     intensity_scale = float(rng.uniform(0.7, 1.3))
     temp_shift = float(rng.uniform(-0.05, 0.05))
@@ -245,25 +333,40 @@ def _randomize_surgical_lighting(env, rng: np.random.RandomState) -> dict:
     }
     from pxr import Gf
     stage = env.sim.stage
-    # Find ALL light prims in the stage
-    for prim in stage.Traverse():
-        tname = str(prim.GetTypeName())
-        if "Light" not in tname:
+    for light in lighting_baseline:
+        prim = stage.GetPrimAtPath(light["path"])
+        if not prim.IsValid():
             continue
-        # Intensity: scale the existing value
-        for attr_name in ["inputs:intensity", "intensity"]:
-            attr = prim.GetAttribute(attr_name)
-            if attr.IsValid() and attr.Get() is not None:
-                base = float(attr.Get())
-                attr.Set(base * intensity_scale)
-                break
-        # Color
-        for attr_name in ["inputs:color", "color"]:
-            attr = prim.GetAttribute(attr_name)
-            if attr.IsValid() and attr.Get() is not None:
+
+        if light["intensity_attr"] is not None and light["intensity"] is not None:
+            attr = prim.GetAttribute(light["intensity_attr"])
+            if attr.IsValid():
+                attr.Set(float(light["intensity"]) * intensity_scale)
+
+        if light["color_attr"] is not None:
+            attr = prim.GetAttribute(light["color_attr"])
+            if attr.IsValid():
                 attr.Set(Gf.Vec3f(*color))
-                break
+    light_info["num_lights"] = len(lighting_baseline)
     return light_info
+
+
+def _instance_id_key_to_int(key) -> int:
+    """Convert Isaac Sim instance-id map keys to the integer stored in the mask."""
+    if isinstance(key, tuple):
+        r, g, b, a = (int(x) for x in key)
+        return r | (g << 8) | (b << 16) | (a << 24)
+    return int(key)
+
+
+def _label_entry_to_prim_path(label_entry) -> str:
+    """Extract a prim path string from Isaac Sim idToLabels entries."""
+    if isinstance(label_entry, dict):
+        for key in ("primPath", "prim_path", "path", "class"):
+            value = label_entry.get(key)
+            if value:
+                return str(value)
+    return str(label_entry)
 
 
 def _build_instance_to_category(info: dict) -> dict[int, int]:
@@ -271,21 +374,22 @@ def _build_instance_to_category(info: dict) -> dict[int, int]:
     id_to_labels = info.get("instance_id_segmentation_fast", {}).get("idToLabels", {})
     mapping = {}
     for inst_id, prim_path in id_to_labels.items():
-        inst_id = int(inst_id)
+        inst_id = _instance_id_key_to_int(inst_id)
+        prim_path = _label_entry_to_prim_path(prim_path)
         if "Robot/" in prim_path:
-            mapping[inst_id] = 1  # robot
-        elif "trocar_1/" in prim_path:
-            mapping[inst_id] = 2  # trocar_1
-        elif "trocar_2/" in prim_path:
-            mapping[inst_id] = 3  # trocar_2
+            mapping[inst_id] = 2  # robot
+        elif "trocar_1" in prim_path:
+            mapping[inst_id] = 3  # trocar_1
+        elif "trocar_2" in prim_path:
+            mapping[inst_id] = 4  # trocar_2
         elif "surgical_tray/" in prim_path:
-            mapping[inst_id] = 4  # tray
+            mapping[inst_id] = 5  # tray
         elif "Cart001" in prim_path:
-            mapping[inst_id] = 5  # cart
+            mapping[inst_id] = 6  # cart
         elif "InstrumentTrolley" in prim_path:
-            mapping[inst_id] = 6  # instrument_trolley
+            mapping[inst_id] = 7  # instrument_trolley
         elif "FlatGrid" in prim_path or "GroundPlane" in prim_path:
-            mapping[inst_id] = 7  # ground
+            mapping[inst_id] = 1  # ground
         else:
             mapping[inst_id] = 0  # background / unknown
     return mapping
@@ -294,6 +398,11 @@ def _build_instance_to_category(info: dict) -> dict[int, int]:
 def create_env():
     """Create IsaacLab env with instance segmentation cameras."""
     env_cfg = parse_env_cfg(TASK_ID, device=args.model_device, num_envs=args.num_envs)
+    if hasattr(env_cfg.events, "reset_tray_random_rotation"):
+        env_cfg.events.reset_tray_random_rotation.params["rotation_range"] = [
+            args.tray_yaw_min_deg,
+            args.tray_yaw_max_deg,
+        ]
 
     for cam_name in CAMERA_KEYS:
         cam_cfg = getattr(env_cfg.scene, cam_name)
@@ -393,6 +502,137 @@ def wrap_obs_rlinf(obs: dict, num_envs: int) -> dict:
 INV_PERM = np.argsort(PERM_TO_REF)  # ref order → internal order
 
 
+def load_fixed_initial_state_ref(dataset_dir: str, episode_idx: int, frame_idx: int) -> np.ndarray:
+    """Load one 28-DoF reference-order state from a LeRobot episode parquet."""
+    dataset_path = Path(dataset_dir).expanduser()
+    episode_path = dataset_path / "data" / "chunk-000" / f"episode_{episode_idx:06d}.parquet"
+    if not episode_path.exists():
+        matches = sorted((dataset_path / "data").glob(f"chunk-*/episode_{episode_idx:06d}.parquet"))
+        if not matches:
+            raise FileNotFoundError(f"Could not find episode_{episode_idx:06d}.parquet under {dataset_path}/data.")
+        episode_path = matches[0]
+
+    df = pd.read_parquet(episode_path, columns=["observation.state"])
+    if frame_idx < 0 or frame_idx >= len(df):
+        raise IndexError(f"Frame {frame_idx} out of range for {episode_path} with {len(df)} frames.")
+
+    state_ref = np.asarray(df["observation.state"].iloc[frame_idx], dtype=np.float32)
+    if state_ref.shape != (len(PERM_TO_REF),):
+        raise ValueError(f"Expected observation.state shape {(len(PERM_TO_REF),)}, got {state_ref.shape}.")
+    return state_ref
+
+
+def _get_joint_pos_action_term(env):
+    if "joint_pos" in env.action_manager.active_terms:
+        return env.action_manager.get_term("joint_pos")
+    if len(env.action_manager.active_terms) == 1:
+        return env.action_manager.get_term(env.action_manager.active_terms[0])
+    raise RuntimeError(f"Could not identify joint position action term from {env.action_manager.active_terms}.")
+
+
+def _as_action_vector(value: torch.Tensor | float, action_dim: int, device: torch.device) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        value = value.to(device=device, dtype=torch.float32)
+        if value.ndim == 2:
+            value = value[0]
+        return value.reshape(action_dim)
+    return torch.full((action_dim,), float(value), device=device, dtype=torch.float32)
+
+
+def _get_action_joint_ids(env) -> torch.Tensor:
+    action_term = _get_joint_pos_action_term(env)
+    joint_pos = wp.to_torch(env.scene["robot"].data.joint_pos)
+    joint_ids = action_term._joint_ids
+    if isinstance(joint_ids, slice):
+        joint_ids = torch.arange(joint_pos.shape[1], device=joint_pos.device, dtype=torch.long)[joint_ids]
+    else:
+        joint_ids = torch.as_tensor(joint_ids, device=joint_pos.device, dtype=torch.long)
+    if joint_ids.numel() != action_term.action_dim:
+        raise RuntimeError(
+            f"Action joint id count {joint_ids.numel()} does not match action dim {action_term.action_dim}."
+        )
+    return joint_ids
+
+
+def fixed_initial_state_ref_to_raw_action(env, state_ref: np.ndarray) -> np.ndarray:
+    """Convert a reference-order joint position state to the env raw action space."""
+    action_term = _get_joint_pos_action_term(env)
+    if action_term.action_dim != ROBOT_ACTION_DIM:
+        raise RuntimeError(f"Expected action dim {ROBOT_ACTION_DIM}, got {action_term.action_dim}.")
+
+    target_joint_pos = np.zeros(ROBOT_ACTION_DIM, dtype=np.float32)
+    target_joint_pos[ACTION_PREFIX_PAD:] = np.asarray(state_ref, dtype=np.float32)[INV_PERM]
+
+    device = torch.device(env.device)
+    target = torch.tensor(target_joint_pos, dtype=torch.float32, device=device)
+    scale = _as_action_vector(action_term._scale, action_term.action_dim, device)
+    offset = _as_action_vector(action_term._offset, action_term.action_dim, device)
+    raw_action = ((target - offset) / scale).cpu().numpy().astype(np.float32)
+    raw_action[:ACTION_PREFIX_PAD] = 0.0
+    return raw_action
+
+
+def _fixed_initial_state_error(env, target_state_ref: np.ndarray) -> float:
+    states_ref = get_joint_states_batch(env)[:, PERM_TO_REF]
+    error = np.abs(states_ref - target_state_ref[np.newaxis, :])
+    return float(error.max()) if error.size else 0.0
+
+
+def _write_fixed_initial_state_to_sim(env, target_state_ref: np.ndarray) -> None:
+    """Directly write the fixed start pose to the controlled robot joints."""
+    robot = env.scene["robot"]
+    joint_ids = _get_action_joint_ids(env)[ACTION_PREFIX_PAD:].to(dtype=torch.int32)
+    target_internal = np.asarray(target_state_ref, dtype=np.float32)[INV_PERM]
+    target_pos = torch.tensor(target_internal, dtype=torch.float32, device=env.device).repeat(env.num_envs, 1)
+    target_vel = torch.zeros_like(target_pos)
+    env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int32)
+    robot.write_joint_position_to_sim_index(position=target_pos, joint_ids=joint_ids, env_ids=env_ids)
+    robot.write_joint_velocity_to_sim_index(velocity=target_vel, joint_ids=joint_ids, env_ids=env_ids)
+
+
+def apply_fixed_initial_state(
+    env,
+    obs: dict,
+    fixed_raw_action: np.ndarray | None,
+    target_state_ref: np.ndarray | None,
+    steps: int,
+    tolerance: float,
+    mode: str = "command",
+) -> tuple[dict, dict | None]:
+    """Command a fixed start pose for a few env steps before policy inference."""
+    if fixed_raw_action is None or target_state_ref is None:
+        return obs, None
+
+    if mode in ("teleport", "teleport_settle"):
+        _write_fixed_initial_state_to_sim(env, target_state_ref)
+
+    action_batch = np.repeat(fixed_raw_action[np.newaxis, :], env.num_envs, axis=0)
+    action_tensor = torch.tensor(action_batch, dtype=torch.float32, device=env.device)
+    steps_run = 0
+    max_state_error = _fixed_initial_state_error(env, target_state_ref)
+
+    for warm_step in range(max(steps, 0)):
+        obs, _, _, _, _ = env.step(action_tensor)
+        steps_run = warm_step + 1
+        max_state_error = _fixed_initial_state_error(env, target_state_ref)
+        if mode == "command" and max_state_error <= tolerance:
+            break
+    if mode == "teleport":
+        # Set the exact requested start pose after the settling steps so policy inference
+        # starts from a fixed robot state while objects have already settled.
+        _write_fixed_initial_state_to_sim(env, target_state_ref)
+        max_state_error = _fixed_initial_state_error(env, target_state_ref)
+
+    return obs, {
+        "mode": mode,
+        "steps": steps_run,
+        "max_state_error": max_state_error,
+        "target_state_ref": target_state_ref.tolist(),
+        "target_left_hand_ref": target_state_ref[14:21].tolist(),
+        "target_right_hand_ref": target_state_ref[21:28].tolist(),
+    }
+
+
 def wrap_obs_gr00t(env) -> dict:
     """Build observation dict for Gr00tPolicy.get_action() (single env only).
 
@@ -412,8 +652,7 @@ def wrap_obs_gr00t(env) -> dict:
         obs_dict[gr00t_key] = img[np.newaxis]             # (1, H, W, 3)
 
     # Joint states in ref order (same as training data)
-    states_internal = get_joint_states_batch(env)[0]      # (28,) internal order
-    states_ref = states_internal[PERM_TO_REF]             # (28,) ref order
+    states_ref = get_joint_states_batch(env)[0]           # (28,) ref order
     obs_dict["state.left_arm"]   = states_ref[0:7][np.newaxis]   # (1, 7)
     obs_dict["state.right_arm"]  = states_ref[7:14][np.newaxis]  # (1, 7)
     obs_dict["state.left_hand"]  = states_ref[14:21][np.newaxis] # (1, 7)
@@ -426,8 +665,7 @@ def wrap_obs_gr00t(env) -> dict:
 def gr00t_action_chunk_to_isaaclab(action_dict: dict) -> np.ndarray:
     """Convert Gr00tPolicy action dict → Isaac Lab action chunk.
 
-    Concatenates the four action keys in ref order, applies the inverse
-    permutation to recover internal joint order, then prepends 15 zero-padded
+    Concatenates the four action keys in ref order, then prepends 15 zero-padded
     body joints that the env action space requires.
 
     Returns:
@@ -497,8 +735,11 @@ def get_camera_segmentation_batch(env, cam_name: str, inst_to_cat: dict) -> np.n
     seg = sensor.data.output["instance_id_segmentation_fast"]  # (B, H, W) int32
     if isinstance(seg, torch.Tensor):
         seg = seg.cpu().numpy()
-    if seg.ndim == 4:
+    if seg.ndim == 4 and seg.shape[-1] == 1:
         seg = seg[..., 0]
+    elif seg.ndim == 4 and seg.shape[-1] == 4:
+        seg = seg.astype(np.uint32)
+        seg = seg[..., 0] | (seg[..., 1] << 8) | (seg[..., 2] << 16) | (seg[..., 3] << 24)
     # Merge instance IDs into category IDs
     merged = np.zeros_like(seg, dtype=np.uint8)
     for inst_id, cat_id in inst_to_cat.items():
@@ -541,7 +782,7 @@ def save_episode_data(
     data_dir = output_dir / "data" / chunk_dir
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Reorder hand joints from internal order → reference dataset order
+    # States/actions are already in reference dataset order.
     perm = np.array(PERM_TO_REF)
     states_ref = [np.asarray(s, dtype=np.float32)[perm] for s in states]
     actions_ref = [np.asarray(a, dtype=np.float32)[perm] for a in actions]
@@ -739,6 +980,25 @@ def save_metadata(output_dir: Path, episode_lengths: list, joint_names: list):
             json.dump(global_stats, f, indent=2)
 
 
+def save_episode_results(output_dir: Path, episode_results: list[dict]):
+    """Save episode-level success metadata.
+
+    Args:
+        output_dir: Directory to write the metadata file to.
+        episode_results: Episode result dictionaries accumulated so far.
+    """
+    tmp_path = output_dir / "episode_results.json.tmp"
+    final_path = output_dir / "episode_results.json"
+    with open(tmp_path, "w") as f:
+        json.dump({
+            "total_episodes": len(episode_results),
+            "success_count": sum(1 for r in episode_results if r["success"]),
+            "fail_count": sum(1 for r in episode_results if not r["success"]),
+            "episodes": sorted(episode_results, key=lambda x: x["episode_index"]),
+        }, f, indent=2)
+    os.replace(tmp_path, final_path)
+
+
 def _compute_field_stats(arr: np.ndarray) -> dict:
     """Compute min/max/mean/std/q01/q99 for each dim of a (T, D) array."""
     return {
@@ -760,6 +1020,26 @@ def main():
 
     print("[INFO] Creating environment...")
     env = create_env()
+
+    fixed_initial_state_ref = None
+    fixed_initial_raw_action = None
+    if args.fixed_initial_state_dataset:
+        if args.num_envs != 1:
+            raise ValueError("--fixed_initial_state_dataset currently requires --num_envs 1 to avoid perturbing active envs.")
+        fixed_initial_state_ref = load_fixed_initial_state_ref(
+            args.fixed_initial_state_dataset,
+            args.fixed_initial_state_episode,
+            args.fixed_initial_state_frame,
+        )
+        fixed_initial_raw_action = fixed_initial_state_ref_to_raw_action(env, fixed_initial_state_ref)
+        print(
+            "[INFO] Fixed initial state enabled: "
+            f"dataset={args.fixed_initial_state_dataset}, "
+            f"episode={args.fixed_initial_state_episode}, frame={args.fixed_initial_state_frame}, "
+            f"warmup_steps={args.fixed_initial_state_steps}"
+        )
+        print(f"[INFO] Fixed initial left hand ref: {fixed_initial_state_ref[14:21].tolist()}")
+        print(f"[INFO] Fixed initial right hand ref: {fixed_initial_state_ref[21:28].tolist()}")
 
     print(f"[INFO] Loading GR00T model from {args.model_path}...")
     config_dir = str(
@@ -874,22 +1154,6 @@ def main():
     episode_results = []
 
     inst_to_cat = {}
-    if not args.no_mask:
-        print("[INFO] Building instance-to-category mapping...")
-        first_sensor = env.scene.sensors[CAMERA_KEYS[0]]
-        cam_info = first_sensor.data.info
-        if isinstance(cam_info, list):
-            info_dict = cam_info[0] if cam_info else {}
-        else:
-            info_dict = cam_info
-        if isinstance(info_dict, str):
-            import ast
-            info_dict = ast.literal_eval(info_dict)
-        inst_to_cat = _build_instance_to_category(info_dict)
-        with open(output_dir / "category_mapping.json", "w") as f:
-            json.dump({"categories": CATEGORY_NAMES, "instance_to_category": {str(k): v for k, v in inst_to_cat.items()}}, f, indent=2)
-        print(f"  Mapped {len(inst_to_cat)} instance IDs to {len(set(inst_to_cat.values()))} categories")
-
     num_envs = args.num_envs
     total_needed = args.num_episodes
     open_loop_steps = args.open_loop_steps if args.open_loop_steps is not None else (8 if args.use_gr00t_policy else 1)
@@ -914,6 +1178,7 @@ def main():
 
     # Per-episode lighting RNG (use args.seed as base)
     light_rng_base = args.seed if args.seed is not None else 0
+    lighting_baseline = _capture_surgical_lighting_baseline(env) if args.randomize_lighting else []
 
     # Per-env init state captured at episode start
     env_init_states = [None] * args.num_envs
@@ -923,7 +1188,21 @@ def main():
         cached_policy_actions = []
         light_info = None
         if args.randomize_lighting:
-            light_info = _randomize_surgical_lighting(env, np.random.RandomState(light_rng_base))
+            light_info = _randomize_surgical_lighting(
+                env,
+                np.random.RandomState(light_rng_base),
+                lighting_baseline,
+            )
+        fixed_initial_info = None
+        obs, fixed_initial_info = apply_fixed_initial_state(
+            env,
+            obs,
+            fixed_initial_raw_action,
+            fixed_initial_state_ref,
+            args.fixed_initial_state_steps,
+            args.fixed_initial_state_tolerance,
+            args.fixed_initial_state_mode,
+        )
         # Flush camera: same method as RLinf _patched_reset
         import omni.kit.app
         _app = omni.kit.app.get_app()
@@ -934,10 +1213,35 @@ def main():
             sensor.update(dt=0.0, force_recompute=True)
         obs = env.observation_manager.compute(update_history=True)
 
+        if not args.no_mask:
+            print("[INFO] Building instance-to-category mapping...")
+            first_sensor = env.scene.sensors[CAMERA_KEYS[0]]
+            cam_info = first_sensor.data.info
+            if isinstance(cam_info, list):
+                info_dict = cam_info[0] if cam_info else {}
+            else:
+                info_dict = cam_info
+            if isinstance(info_dict, str):
+                import ast
+                info_dict = ast.literal_eval(info_dict)
+            inst_to_cat = _build_instance_to_category(info_dict)
+            with open(output_dir / "category_mapping.json", "w") as f:
+                json.dump(
+                    {
+                        "categories": CATEGORY_NAMES,
+                        "instance_to_category": {str(k): v for k, v in inst_to_cat.items()},
+                    },
+                    f,
+                    indent=2,
+                )
+            print(f"  Mapped {len(inst_to_cat)} instance IDs to {len(set(inst_to_cat.values()))} categories")
+
         # Capture init state for env 0 (assigned to first episode)
         init_state = _capture_episode_init_state(env)
         if light_info is not None:
             init_state["lighting"] = light_info
+        if fixed_initial_info is not None:
+            init_state["fixed_initial_state"] = fixed_initial_info
         init_state["seed"] = args.seed
         env_init_states[0] = init_state
 
@@ -1059,7 +1363,8 @@ def main():
                 n_success = sum(1 for r in episode_results if r["success"])
                 sr = n_success / n_done * 100
                 print(f"  Episode {ep_idx}: {ep_length} steps — {status} ({reason})  "
-                      f"[{n_done}/{total_needed}]  success rate: {n_success}/{n_done} ({sr:.1f}%)")
+                      f"[{n_done}/{total_needed}]  success rate: {n_success}/{n_done} ({sr:.1f}%)",
+                      flush=True)
 
                 save_episode_data(output_dir, ep_idx, buf["timestamps"], buf["states"],
                                   buf["actions"], buf["frames"], buf["masks"],
@@ -1078,6 +1383,8 @@ def main():
                     ep_result["init_state"] = env_init_states[i]
                     episode_results[-1]["init_state"] = env_init_states[i]
 
+                save_episode_results(output_dir, episode_results)
+
                 # Reset buffer and assign next episode
                 buffers[i] = _new_buffer()
                 cached_policy_actions = []
@@ -1090,7 +1397,21 @@ def main():
                     next_light_info = None
                     if args.randomize_lighting:
                         light_seed = light_rng_base + env_ep_idx[i] * 7919
-                        next_light_info = _randomize_surgical_lighting(env, np.random.RandomState(light_seed))
+                        next_light_info = _randomize_surgical_lighting(
+                            env,
+                            np.random.RandomState(light_seed),
+                            lighting_baseline,
+                        )
+                    fixed_initial_info = None
+                    obs, fixed_initial_info = apply_fixed_initial_state(
+                        env,
+                        obs,
+                        fixed_initial_raw_action,
+                        fixed_initial_state_ref,
+                        args.fixed_initial_state_steps,
+                        args.fixed_initial_state_tolerance,
+                        args.fixed_initial_state_mode,
+                    )
                     # Flush camera: same method as RLinf _patched_reset
                     env.sim.set_setting("/app/player/playSimulations", False)
                     _app.update()
@@ -1102,6 +1423,8 @@ def main():
                     init_state = _capture_episode_init_state(env)
                     if next_light_info is not None:
                         init_state["lighting"] = next_light_info
+                    if fixed_initial_info is not None:
+                        init_state["fixed_initial_state"] = fixed_initial_info
                     init_state["seed"] = light_seed if args.randomize_lighting else None
                     env_init_states[i] = init_state
                 else:
@@ -1109,21 +1432,15 @@ def main():
                     env_init_states[i] = None
 
     # Save episode results
-    with open(output_dir / "episode_results.json", "w") as f:
-        json.dump({
-            "total_episodes": len(episode_results),
-            "success_count": sum(1 for r in episode_results if r["success"]),
-            "fail_count": sum(1 for r in episode_results if not r["success"]),
-            "episodes": sorted(episode_results, key=lambda x: x["episode_index"]),
-        }, f, indent=2)
+    save_episode_results(output_dir, episode_results)
 
     # Save metadata
     save_metadata(output_dir, episode_lengths, joint_names)
 
     success_count = sum(1 for r in episode_results if r["success"])
-    print(f"\n[INFO] Done! Recorded {len(episode_lengths)} episodes to {output_dir}")
-    print(f"  Total frames: {sum(episode_lengths)}")
-    print(f"  Success: {success_count}/{len(episode_results)}")
+    print(f"\n[INFO] Done! Recorded {len(episode_lengths)} episodes to {output_dir}", flush=True)
+    print(f"  Total frames: {sum(episode_lengths)}", flush=True)
+    print(f"  Success: {success_count}/{len(episode_results)}", flush=True)
 
     env.close()
     simulation_app.close()

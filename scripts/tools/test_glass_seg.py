@@ -106,14 +106,25 @@ def _build_inst_to_cat(sensor) -> dict[int, int]:
     return mapping
 
 
+def _segmentation_to_instance_ids(seg: np.ndarray) -> np.ndarray:
+    """Convert segmentation output to an integer instance-id image."""
+    if seg.ndim == 3 and seg.shape[-1] == 1:
+        return seg[..., 0]
+    if seg.ndim == 3 and seg.shape[-1] == 4:
+        seg = seg.astype(np.uint32)
+        return seg[..., 0] | (seg[..., 1] << 8) | (seg[..., 2] << 16) | (seg[..., 3] << 24)
+    return seg
+
+
 def _get_seg(env, inst_to_cat: dict[int, int]) -> np.ndarray:
     seg = env.scene.sensors[CAM_KEY].data.output["instance_id_segmentation_fast"][0]
     if isinstance(seg, torch.Tensor):
         seg = seg.cpu().numpy()
+    seg = _segmentation_to_instance_ids(seg)
     h, w = seg.shape[:2]
     label_img = np.zeros((h, w), dtype=np.uint8)
     for inst_id, cat in inst_to_cat.items():
-        label_img[seg[..., 0] == inst_id] = cat
+        label_img[seg == inst_id] = cat
     return label_img
 
 
@@ -161,6 +172,7 @@ def main():
     env_cfg = parse_env_cfg(TASK_ID, device="cuda:0", num_envs=1)
     cam_cfg = getattr(env_cfg.scene, CAM_KEY)
     cam_cfg.data_types = ["rgb", "instance_id_segmentation_fast"]
+    cam_cfg.colorize_instance_id_segmentation = False
     env_cfg.recorders = {}
     import gymnasium as gym
     env = gym.make(TASK_ID, cfg=env_cfg).unwrapped

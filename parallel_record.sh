@@ -4,22 +4,49 @@
 # 用法:
 #   bash parallel_record.sh [总episode数] [GPU列表(逗号分隔)] [skip_first_n] [rand_light] [post_process] [output_dir] [open_loop_steps] [额外record参数...]
 # 例:
-#   bash parallel_record.sh 30 1,2,3,5 3 1 both /tmp/out 8 --model_path /path/to/ckpt
+#   bash parallel_record.sh 100 0,1,2,3 3 1 both /tmp/out 1 --model_path /path/to/ckpt
+#   BASE_SEED=123456 bash parallel_record.sh 800 4,5,6,7
 # post_process: none / success / split / both (default: both = success + split-by-stage)
 # ============================================================
 set -e
+set -o pipefail
 
 START_TIME=$(date +%s)
 
-TOTAL_EPISODES=${1:-30}
-GPU_LIST=${2:-"0,1,2,3,5,6"}
+TOTAL_EPISODES=${1:-100}
+GPU_LIST=${2:-"0,1,2,3"}
 SKIP_FIRST_N=${3:-3}
-RANDOMIZE_LIGHTING=${4:-0}
+RANDOMIZE_LIGHTING=${4:-1}
 POST_PROCESS=${5:-both}  # none | success | split | both
-BASE_OUTPUT_DIR=${6:-"/localhome/local-vennw/data/trocar_parallel"}
+BASE_OUTPUT_DIR=${6:-"/localhome/local-vennw/code/trocar_parallel_1_steps_default_rand_light_fix_seed_issue"}
 OPEN_LOOP_STEPS=${7:-1}
 EXTRA_ARGS=("${@:8}")
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+CONDA_DIR=${CONDA_DIR:-"/localhome/local-vennw/miniconda3"}
+ISAACLAB_DIR=${ISAACLAB_DIR:-"/localhome/local-vennw/code/IsaacLab"}
+ISAACSIM_DIR=${ISAACSIM_DIR:-"/localhome/local-vennw/isaac-sim-standalone-6.0.0-rc.22"}
+MODEL_PATH=${MODEL_PATH:-"/localhome/local-vennw/models/orca_rlinf_weights/rlinf/actor/model_state_dict"}
+MAX_STEPS=${MAX_STEPS:-300}
+DENOISING_STEPS=${DENOISING_STEPS:-4}
+SKIP_LAST_N=${SKIP_LAST_N:-1}
+TRAY_YAW_MIN_DEG=${TRAY_YAW_MIN_DEG:-0}
+TRAY_YAW_MAX_DEG=${TRAY_YAW_MAX_DEG:-10}
+BASE_SEED=${BASE_SEED:-$(date +%s)}
+PY="/localhome/local-vennw/miniconda3/envs/isaaclab_develop_6.0/bin/python"
+
+# ---- IsaacLab / Isaac Sim environment ----
+source "$CONDA_DIR/etc/profile.d/conda.sh"
+conda activate isaaclab_develop_6.0
+
+export ISAAC_PATH="$ISAACSIM_DIR"
+export EXP_PATH="$ISAAC_PATH/apps"
+export CARB_APP_PATH="$ISAAC_PATH/kit"
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH}"
+unset DISPLAY
+export MESA_GL_VERSION_OVERRIDE=4.6
 
 # Parse GPU list into array
 IFS=',' read -ra GPU_ARRAY <<< "$GPU_LIST"
@@ -34,13 +61,22 @@ echo "Parallel recording: ${TOTAL_EPISODES} episodes on ${NUM_GPUS} GPUs"
 echo "  GPUs: ${GPU_LIST}"
 echo "  Per GPU: ${PER_GPU} episodes (+ ${REMAINDER} extra on first GPUs)"
 echo "  Skip first N frames: ${SKIP_FIRST_N}"
+echo "  Skip last N frames: ${SKIP_LAST_N}"
 echo "  Open-loop steps: ${OPEN_LOOP_STEPS}"
+echo "  Max steps: ${MAX_STEPS}"
+echo "  Randomize lighting: ${RANDOMIZE_LIGHTING}"
+echo "  Tray yaw [deg]: ${TRAY_YAW_MIN_DEG} .. ${TRAY_YAW_MAX_DEG}"
+echo "  Base seed: ${BASE_SEED}"
+echo "  Model: ${MODEL_PATH}"
 echo "  Output: ${BASE_OUTPUT_DIR}"
 echo "============================================================"
 
 mkdir -p "$BASE_OUTPUT_DIR"
+cd "$ISAACLAB_DIR"
 
 PIDS=()
+PID_GPUS=()
+PID_EXPECTED=()
 for IDX in "${!GPU_ARRAY[@]}"; do
     GPU_ID=${GPU_ARRAY[$IDX]}
 
@@ -57,29 +93,36 @@ for IDX in "${!GPU_ARRAY[@]}"; do
     GPU_OUTPUT="${BASE_OUTPUT_DIR}/gpu_${GPU_ID}"
     LOG_FILE="${BASE_OUTPUT_DIR}/gpu_${GPU_ID}.log"
 
-    echo "  GPU ${GPU_ID}: ${EP_COUNT} episodes → ${GPU_OUTPUT}"
-
-    SEED=$((42 + GPU_ID * 1000))
-    # Don't use CUDA_VISIBLE_DEVICES — Isaac Sim's renderer ignores it and falls back to GPU 0.
-    # Pass the physical GPU id via --device so AppLauncher sets active_gpu/physics_gpu correctly.
+    SEED=$((BASE_SEED + GPU_ID * 1000 + IDX))
+    echo "  GPU ${GPU_ID}: ${EP_COUNT} episodes → ${GPU_OUTPUT} (seed ${SEED}, visible as cuda:0 inside worker)"
+    # IsaacLab Fabric/Warp paths used by this task only support cuda:0 reliably.
+    # Isolate each worker to one physical GPU, then use cuda:0 inside the process.
     LIGHT_FLAG=""
     if [ "$RANDOMIZE_LIGHTING" = "1" ]; then
         LIGHT_FLAG="--randomize_lighting"
     fi
-    bash "${SCRIPT_DIR}/record_trocar.sh" \
+    PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="$GPU_ID" ./isaaclab.sh -p scripts/tools/record_trocar_episodes.py \
+        --model_path "$MODEL_PATH" \
+        --output_dir "$GPU_OUTPUT" \
         --num_envs 1 \
         --num_episodes $EP_COUNT \
-        --output_dir "$GPU_OUTPUT" \
+        --max_steps "$MAX_STEPS" \
+        --denoising_steps "$DENOISING_STEPS" \
         --seed $SEED \
         --skip_first_n $SKIP_FIRST_N \
-        --device cuda:$GPU_ID \
-        --model_device cuda:$GPU_ID \
+        --skip_last_n "$SKIP_LAST_N" \
+        --device cuda:0 \
+        --model_device cuda:0 \
         --open_loop_steps $OPEN_LOOP_STEPS \
+        --tray_yaw_min_deg "$TRAY_YAW_MIN_DEG" \
+        --tray_yaw_max_deg "$TRAY_YAW_MAX_DEG" \
         $LIGHT_FLAG \
         "${EXTRA_ARGS[@]}" \
         > "$LOG_FILE" 2>&1 &
 
     PIDS+=($!)
+    PID_GPUS+=("$GPU_ID")
+    PID_EXPECTED+=("$EP_COUNT")
 done
 
 echo ""
@@ -91,16 +134,35 @@ echo ""
 FAILED=0
 for i in "${!PIDS[@]}"; do
     if wait ${PIDS[$i]}; then
-        echo "  GPU ${GPU_ARRAY[$i]}: done"
+        echo "  GPU ${PID_GPUS[$i]}: process exited"
     else
-        echo "  GPU ${GPU_ARRAY[$i]}: FAILED (see ${BASE_OUTPUT_DIR}/gpu_${GPU_ARRAY[$i]}.log)"
+        echo "  GPU ${PID_GPUS[$i]}: FAILED (see ${BASE_OUTPUT_DIR}/gpu_${PID_GPUS[$i]}.log)"
         FAILED=$((FAILED + 1))
+    fi
+done
+
+for i in "${!PID_GPUS[@]}"; do
+    GPU_ID=${PID_GPUS[$i]}
+    EXPECTED=${PID_EXPECTED[$i]}
+    GPU_OUTPUT="${BASE_OUTPUT_DIR}/gpu_${GPU_ID}"
+    LOG_FILE="${BASE_OUTPUT_DIR}/gpu_${GPU_ID}.log"
+    EP_DIR="${GPU_OUTPUT}/data/chunk-000"
+    if [ -d "$EP_DIR" ]; then
+        EP_WRITTEN=$(find "$EP_DIR" -maxdepth 1 -type f -name 'episode_*.parquet' | wc -l)
+    else
+        EP_WRITTEN=0
+    fi
+    if [ "$EP_WRITTEN" -ne "$EXPECTED" ] || [ ! -f "${GPU_OUTPUT}/episode_results.json" ]; then
+        echo "  GPU ${GPU_ID}: INVALID output (${EP_WRITTEN}/${EXPECTED} episodes; see ${LOG_FILE})"
+        FAILED=$((FAILED + 1))
+    else
+        echo "  GPU ${GPU_ID}: wrote ${EP_WRITTEN}/${EXPECTED} episodes"
     fi
 done
 
 if [ $FAILED -gt 0 ]; then
     echo ""
-    echo "WARNING: ${FAILED} GPU(s) failed. Check logs."
+    echo "WARNING: ${FAILED} worker/output validation failure(s). Check logs."
     exit 1
 fi
 
@@ -111,7 +173,7 @@ echo "============================================================"
 
 # Merge: renumber episodes and combine into single output
 MERGED_DIR="${BASE_OUTPUT_DIR}/merged"
-python3 -c "
+$PY -c "
 import json, shutil, os
 from pathlib import Path
 
@@ -122,8 +184,9 @@ merged.mkdir(parents=True, exist_ok=True)
 ep_idx = 0
 all_results = []
 all_lengths = []
+gpu_dirs = sorted(p for p in base.glob('gpu_*') if p.is_dir())
 
-for gpu_dir in sorted(base.glob('gpu_*')):
+for gpu_dir in gpu_dirs:
     data_dir = gpu_dir / 'data/chunk-000'
     if not data_dir.exists():
         continue
@@ -167,7 +230,10 @@ with open(merged / 'episode_results.json', 'w') as f:
         'episodes': all_results,
     }, f, indent=2)
 
-first_gpu = sorted(base.glob('gpu_*'))[0]
+if not gpu_dirs:
+    raise RuntimeError(f'No gpu_* output directories found under {base}')
+
+first_gpu = gpu_dirs[0]
 for f in ['category_mapping.json']:
     src = first_gpu / f
     if src.exists():
@@ -271,7 +337,6 @@ echo "Merged data: ${MERGED_DIR}"
 ISAACLAB_DIR="$(dirname "$SCRIPT_DIR")/IsaacLab"
 # When parallel_record.sh is inside the IsaacLab directory, use $SCRIPT_DIR directly
 ISAACLAB_DIR="$SCRIPT_DIR"
-PY="/localhome/local-vennw/miniconda3/envs/isaaclab_develop_6.0/bin/python"
 
 if [ "$POST_PROCESS" = "success" ] || [ "$POST_PROCESS" = "both" ]; then
     SUCCESS_DIR="${BASE_OUTPUT_DIR}/success_only"

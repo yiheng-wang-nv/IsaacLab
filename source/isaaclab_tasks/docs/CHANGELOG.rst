@@ -1,6 +1,16 @@
 Changelog
 ---------
 
+1.5.14 (2026-04-29)
+~~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Fixed trocar tip offset detection to fall back to geometry bounds when tip marker
+  prims are unavailable in updated trocar USD assets.
+
+
 1.5.13 (2026-03-18)
 ~~~~~~~~~~~~~~~~~~~
 

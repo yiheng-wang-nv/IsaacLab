@@ -79,3 +79,7 @@ tests/
 
 # Ruff cache
 **/.ruff_cache/
+trocar_preview_outputs/
+trocar_stage_retry_demo_prompt_free/
+reason2_retry_hand_samples/
+.codex

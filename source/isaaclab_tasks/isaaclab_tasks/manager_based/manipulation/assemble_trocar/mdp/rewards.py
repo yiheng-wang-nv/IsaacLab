@@ -345,18 +345,66 @@ def get_trocar_tip_position(
         if asset_cfg.name == "trocar_1":
             tip_path = "/World/envs/env_0/trocar_1/Trocar002/White_pos"
             root_path = "/World/envs/env_0/trocar_1"
+            fallback_tip_z_bound = "max"
+            tip_prim_name = "White_pos"
         elif asset_cfg.name == "trocar_2":
             tip_path = "/World/envs/env_0/trocar_2/DisposableLaparoscopicPunctureDevice001/Red_pos"
             root_path = "/World/envs/env_0/trocar_2"
+            fallback_tip_z_bound = "min"
+            tip_prim_name = "Red_pos"
         else:
             raise ValueError(f"Invalid asset configuration: {asset_cfg.name}")
 
         tip_prim = stage.GetPrimAtPath(tip_path)
         root_prim = stage.GetPrimAtPath(root_path)
+        if not tip_prim.IsValid() and root_prim.IsValid():
+            for prim in Usd.PrimRange(root_prim):
+                if prim.GetName() == tip_prim_name:
+                    tip_prim = prim
+                    break
 
         if not tip_prim.IsValid():
-            print(f"Warning: Tip prim not found at {tip_path}, using zero offset")
-            tip_offset_local = torch.zeros(3, dtype=torch.float32, device=env.device)
+            if root_prim.IsValid():
+                bbox_cache = UsdGeom.BBoxCache(
+                    Usd.TimeCode.Default(), includedPurposes=[UsdGeom.Tokens.default_, UsdGeom.Tokens.render]
+                )
+                root_world_transform = UsdGeom.Xformable(root_prim).ComputeLocalToWorldTransform(
+                    Usd.TimeCode.Default()
+                )
+                root_world_transform_inv = root_world_transform.GetInverse()
+                min_z = float("inf")
+                max_z = float("-inf")
+                found_visual_mesh = False
+                for prim in Usd.PrimRange(root_prim):
+                    if prim.GetTypeName() != "Mesh":
+                        continue
+                    if "/visual" not in str(prim.GetPath()).lower():
+                        continue
+                    mesh_box = bbox_cache.ComputeLocalBound(prim).GetBox()
+                    mesh_min = mesh_box.GetMin()
+                    mesh_max = mesh_box.GetMax()
+                    mesh_world_transform = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                    for x in (mesh_min[0], mesh_max[0]):
+                        for y in (mesh_min[1], mesh_max[1]):
+                            for z in (mesh_min[2], mesh_max[2]):
+                                corner_world = mesh_world_transform.Transform(Gf.Vec3d(x, y, z))
+                                corner_root = root_world_transform_inv.Transform(corner_world)
+                                min_z = min(min_z, corner_root[2])
+                                max_z = max(max_z, corner_root[2])
+                    found_visual_mesh = True
+
+                if found_visual_mesh:
+                    tip_z = max_z if fallback_tip_z_bound == "max" else min_z
+                else:
+                    tip_z = 0.0
+                tip_offset_local = torch.tensor([0.0, 0.0, tip_z], dtype=torch.float32, device=env.device)
+                print(
+                    f"[INFO] Tip prim not found at {tip_path}; "
+                    f"using geometry bound fallback offset for {asset_cfg.name}: {tip_offset_local}"
+                )
+            else:
+                print(f"Warning: Root prim not found at {root_path}, using zero tip offset")
+                tip_offset_local = torch.zeros(3, dtype=torch.float32, device=env.device)
         else:
             tip_xform = UsdGeom.Xformable(tip_prim)
             root_xform = UsdGeom.Xformable(root_prim)
