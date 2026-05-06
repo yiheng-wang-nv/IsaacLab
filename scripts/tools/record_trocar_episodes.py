@@ -44,6 +44,13 @@ parser.add_argument("--use_gr00t_policy", action="store_true", default=False,
 parser.add_argument("--no_mask", action="store_true", default=False,
                     help="Skip segmentation mask recording (faster; only saves RGB videos + parquet).")
 parser.add_argument(
+    "--scene",
+    type=str,
+    default="lightwheel",
+    choices=("lightwheel", "orca", "factory", "surgical_room"),
+    help="Background scene variant. 'lightwheel' is the default scene03.usd.",
+)
+parser.add_argument(
     "--fixed_initial_state_dataset",
     type=str,
     default=None,
@@ -95,7 +102,10 @@ import pandas as pd
 import torch
 import warp as wp
 
+import isaaclab.sim as sim_utils
 import isaaclab_tasks  # noqa: F401 — register tasks
+from isaaclab.assets import AssetBaseCfg
+from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
 # GR00T imports
@@ -113,6 +123,9 @@ from rlinf.models.embodiment.gr00t.gr00t_action_model import GR00T_N1_5_ForRLAct
 # Constants — must match YAML config in assemble_trocar
 # ---------------------------------------------------------------------------
 TASK_ID = "Isaac-Assemble-Trocar-G129-Dex3-RLinf-v0"
+NUCLEUS_SERVER = "isaac-dev.ov.nvidia.com"
+NUCLEUS_HEALTHCARE_BASE = f"omniverse://{NUCLEUS_SERVER}/Library/IsaacHealthcare/0.5.0"
+SCENE1MX2 = f"{NUCLEUS_HEALTHCARE_BASE}/Props/OrcaScenes/Scene1MX2"
 TASK_DESCRIPTION = "install trocar from box"
 FPS = 30.0  # video recording fps (matches reference data format)
 
@@ -395,9 +408,81 @@ def _build_instance_to_category(info: dict) -> dict[int, int]:
     return mapping
 
 
+def apply_scene_variant(env_cfg, variant: str):
+    """Patch env_cfg.scene in-place to use the requested background scene."""
+    if variant == "lightwheel":
+        return  # default, no changes needed
+
+    env_cfg.scene.env_spacing = 50.0
+
+    # Props shared by all non-lightwheel variants (matches i4h-workflows-internal exactly).
+    # Rotations below are in IsaacLab 3.0 xyzw convention.
+    # Original sim5 values were wxyz; converted via (w,x,y,z) -> (x,y,z,w).
+    cart_cfg = AssetBaseCfg(
+        prim_path="/World/envs/env_.*/cart001",
+        spawn=UsdFileCfg(usd_path=f"{NUCLEUS_HEALTHCARE_BASE}/Props/LightWheel/Assets/Cart001/Cart001.usd"),
+        # sim5 wxyz (1,0,0,0) = identity -> sim6 xyzw (0,0,0,1)
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(-1.48242, 2.03195, 0.00279), rot=(0.0, 0.0, 0.0, 1.0)),
+    )
+    trolley_cfg = AssetBaseCfg(
+        prim_path="/World/envs/env_.*/instrument_trolley002",
+        spawn=UsdFileCfg(
+            usd_path=f"{NUCLEUS_HEALTHCARE_BASE}/Props/LightWheel/Assets/InstrumentTrolley001/InstrumentTrolley002.usd",
+            scale=(1.05, 1.05, 1.05),
+        ),
+        # sim5 wxyz (0,0,0,1) = 180° around Z -> sim6 xyzw (0,0,1,0)
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(-1.52131, 1.4862, 0.0), rot=(0.0, 0.0, 1.0, 0.0)),
+    )
+
+
+    if variant == "orca":
+        env_cfg.scene.scene = AssetBaseCfg(
+            prim_path="/World/envs/env_.*/Scene",
+            spawn=UsdFileCfg(usd_path=f"{SCENE1MX2}/main_new_light.usd"),
+            # sim5 wxyz (1,0,0,0) = identity -> sim6 xyzw (0,0,0,1)
+            init_state=AssetBaseCfg.InitialStateCfg(pos=(4.0, -5.5, 0.0), rot=(0.0, 0.0, 0.0, 1.0)),
+        )
+        env_cfg.scene.light = None  # scene has embedded lights; matches i4h (dome commented out)
+        setattr(env_cfg.scene, "cart001", cart_cfg)
+        setattr(env_cfg.scene, "instrument_trolley002", trolley_cfg)
+
+    elif variant == "factory":
+        env_cfg.scene.scene = AssetBaseCfg(
+            prim_path="/World/envs/env_.*/Scene",
+            spawn=UsdFileCfg(usd_path=f"{SCENE1MX2}/rlinf_scenes/factory.usd"),
+            # sim5 wxyz (0,0,0,1) = 180° around Z -> sim6 xyzw (0,0,1,0)
+            init_state=AssetBaseCfg.InitialStateCfg(pos=(1.0, 3.0, 0.0), rot=(0.0, 0.0, 1.0, 0.0)),
+        )
+        env_cfg.scene.light = None  # scene has embedded lights; matches i4h (dome commented out)
+        setattr(env_cfg.scene, "cart001", cart_cfg)
+        setattr(env_cfg.scene, "instrument_trolley002", trolley_cfg)
+
+    elif variant == "surgical_room":
+        env_cfg.scene.scene = AssetBaseCfg(
+            prim_path="/World/envs/env_.*/Scene",
+            spawn=UsdFileCfg(
+                usd_path=f"{SCENE1MX2}/push-cart-OR-scenes/main.usd",
+                scale=(0.008, 0.008, 0.008),
+            ),
+            # sim5 wxyz (0.707,0,0,-0.707) = -90° around Z -> sim6 xyzw (0,0,-0.707,0.707)
+            init_state=AssetBaseCfg.InitialStateCfg(
+                pos=(-3.8, 5.3, 0.0), rot=(0.0, 0.0, -0.70710678, 0.70710678)
+            ),
+        )
+        env_cfg.scene.light = AssetBaseCfg(
+            prim_path="/World/light",
+            spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=1000.0),
+            # sim5 wxyz (1,0,0,0) = identity -> sim6 xyzw (0,0,0,1)
+            init_state=AssetBaseCfg.InitialStateCfg(pos=(-3.8, 5.3, 2.0), rot=(0.0, 0.0, 0.0, 1.0)),
+        )
+        setattr(env_cfg.scene, "cart001", cart_cfg)
+        setattr(env_cfg.scene, "instrument_trolley002", trolley_cfg)
+
+
 def create_env():
     """Create IsaacLab env with instance segmentation cameras."""
     env_cfg = parse_env_cfg(TASK_ID, device=args.model_device, num_envs=args.num_envs)
+    apply_scene_variant(env_cfg, args.scene)
     if hasattr(env_cfg.events, "reset_tray_random_rotation"):
         env_cfg.events.reset_tray_random_rotation.params["rotation_range"] = [
             args.tray_yaw_min_deg,
@@ -1012,12 +1097,38 @@ def _compute_field_stats(arr: np.ndarray) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Nucleus authentication
+# ---------------------------------------------------------------------------
+_NUCLEUS_AUTH_REG = None  # keep reference alive to prevent GC
+
+
+def _setup_nucleus_auth():
+    global _NUCLEUS_AUTH_REG
+    token = os.environ.get("OMNI_PASS") or os.environ.get("OMNI_API_TOKEN", "")
+    if not token:
+        print(
+            "[WARN] No Nucleus API token found (OMNI_PASS / OMNI_API_TOKEN). "
+            "Remote omniverse:// assets may fail to load.",
+            flush=True,
+        )
+        return
+    import omni.client
+
+    def _auth_callback(url_prefix: str):
+        return ("$omni-api-token", token)
+
+    _NUCLEUS_AUTH_REG = omni.client.register_authentication_callback(_auth_callback)
+    print(f"[INFO] Nucleus auth registered for {NUCLEUS_SERVER}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    _setup_nucleus_auth()
     print("[INFO] Creating environment...")
     env = create_env()
 
@@ -1042,6 +1153,9 @@ def main():
         print(f"[INFO] Fixed initial right hand ref: {fixed_initial_state_ref[21:28].tolist()}")
 
     print(f"[INFO] Loading GR00T model from {args.model_path}...")
+    # Prevent any HuggingFace Hub network requests — model must be local.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     config_dir = str(
         Path(__file__).resolve().parents[2]
         / "source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/assemble_trocar/config"

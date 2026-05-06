@@ -92,6 +92,7 @@ offset_dict = {
 
 HEALTHCARE_S3 = "/localhome/local-vennw/models/healthcare_assets/0.5.0/132c82d"
 USD_ROOT = f"{HEALTHCARE_S3}/Props/LightWheel"
+BENCHMARK_ASSETS = "/localhome/local-vennw/code/IsaacLab/benchmark_assets"
 
 
 @configclass
@@ -241,7 +242,7 @@ class TerminationsCfg:
         time_out=False,  # This is a success termination, not a failure
         params={
             "print_log": False,
-            "success_stage": 4,
+            "success_stage": 1,
         },
     )
     object_drop = DoneTerm(

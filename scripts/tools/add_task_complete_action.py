@@ -57,6 +57,51 @@ def _dump_json(path: Path, data: dict) -> None:
         json.dump(data, f, indent=2)
 
 
+def _episode_index_from_path(path: Path) -> int:
+    """Return the episode index encoded in ``episode_XXXXXX.parquet``."""
+    return int(path.stem.split("_")[1])
+
+
+def _episode_parquet_paths(dataset_dir: Path) -> list[Path]:
+    """Return one parquet path per episode, following the dataset chunk metadata."""
+    info = _load_json(dataset_dir / "meta" / "info.json")
+    chunk_size = int(info.get("chunks_size", 1000))
+    data_path = info.get(
+        "data_path",
+        "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+    )
+
+    episodes_path = dataset_dir / "meta" / "episodes.jsonl"
+    if episodes_path.exists():
+        episode_indices = []
+        with episodes_path.open() as f:
+            for line in f:
+                if line.strip():
+                    episode_indices.append(json.loads(line)["episode_index"])
+    else:
+        episode_indices = sorted(
+            {
+                _episode_index_from_path(path)
+                for path in (dataset_dir / "data").glob("chunk-*/episode_*.parquet")
+            }
+        )
+
+    parquet_paths = []
+    for episode_index in sorted(episode_indices):
+        episode_chunk = episode_index // chunk_size
+        path = dataset_dir / data_path.format(
+            episode_chunk=episode_chunk,
+            episode_index=episode_index,
+        )
+        if not path.exists():
+            matches = sorted(
+                (dataset_dir / "data").glob(f"chunk-*/episode_{episode_index:06d}.parquet")
+            )
+            path = matches[0] if matches else path
+        parquet_paths.append(path)
+    return parquet_paths
+
+
 def _append_done_to_action(
     action_values: pd.Series,
     done_last_n: int,
@@ -119,11 +164,10 @@ def main() -> None:
 
     shutil.copytree(args.input_dir, args.output_dir, copy_function=_copy_or_link)
 
-    data_dir = args.output_dir / "data" / "chunk-000"
     meta_dir = args.output_dir / "meta"
-    parquet_paths = sorted(data_dir.glob("episode_*.parquet"))
+    parquet_paths = _episode_parquet_paths(args.output_dir)
     if not parquet_paths:
-        raise RuntimeError(f"No parquet files found in {data_dir}.")
+        raise RuntimeError(f"No parquet files found in {args.output_dir / 'data'}.")
 
     all_actions = []
     per_episode_stats = []

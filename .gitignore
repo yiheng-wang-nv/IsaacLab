@@ -83,3 +83,16 @@ trocar_preview_outputs/
 trocar_stage_retry_demo_prompt_free/
 reason2_retry_hand_samples/
 .codex
+benchmark_assets/
+.claude/
+.bash_profile
+.bashrc
+.gitconfig
+.gitmodules
+.idea
+.mcp.json
+.profile
+.ripgreprc
+.zprofile
+.zshrc
+omni.sh
