@@ -518,12 +518,52 @@ def _create_generic_env_wrapper(task_id: str) -> type:
             # Track real task success (terminated=True from task_success_termination)
             self._task_success_ever = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
 
+        def step(self, actions=None, auto_reset=True):
+            """Step the IsaacLab env while preserving extras needed for metrics."""
+            obs, step_reward, terminations, truncations, infos = self.env.step(actions)
+
+            step_reward = step_reward.clone()
+            terminations = terminations.clone()
+            truncations = truncations.clone()
+
+            obs = self._wrap_obs(obs)
+
+            self._elapsed_steps += 1
+
+            truncations = (self.elapsed_steps >= self.cfg.max_episode_steps) | truncations
+
+            dones = terminations | truncations
+
+            infos = self._record_metrics(step_reward, terminations, infos)
+            if self.ignore_terminations:
+                infos["episode"]["success_at_end"] = terminations
+                terminations[:] = False
+
+            _auto_reset = auto_reset and self.auto_reset
+            if dones.any() and _auto_reset:
+                obs, infos = self._handle_auto_reset(dones, obs, infos)
+
+            return obs, step_reward, terminations, truncations, infos
+
         def _record_metrics(self, step_reward, terminations, infos):
-            """Override to add task_success tracking based on terminated flag."""
-            infos = super()._record_metrics(step_reward, terminations, infos)
-            # task_success_termination sets terminated=True (time_out=False)
+            """Record episode metrics including task_success and task_success_at_stage."""
+            episode_info = {}
+            infos = infos if isinstance(infos, dict) else {}
+            self.returns += step_reward
+            self.success_once = self.success_once | (step_reward > 0)
+
             self._task_success_ever = self._task_success_ever | terminations.bool()
-            infos["episode"]["task_success"] = self._task_success_ever.clone()
+            episode_info["task_success"] = self._task_success_ever.clone()
+
+            task_success_at_stage = infos.get("task_success_at_stage")
+            if isinstance(task_success_at_stage, torch.Tensor):
+                episode_info["task_success_at_stage"] = task_success_at_stage.bool().clone()
+
+            episode_info["success_once"] = self.success_once.clone()
+            episode_info["return"] = self.returns.clone()
+            episode_info["episode_len"] = self.elapsed_steps.clone()
+            episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
+            infos["episode"] = episode_info
             return infos
 
         def _reset_metrics(self, env_idx=None):
@@ -582,6 +622,26 @@ def _create_generic_env_wrapper(task_id: str) -> type:
                     return obs, extras
 
                 env.reset = _patched_reset
+
+                _original_step = env.step
+
+                def _get_task_success_at_stage() -> torch.Tensor | None:
+                    termination_manager = getattr(env, "termination_manager", None)
+                    if termination_manager is None:
+                        return None
+                    if "task_success" not in getattr(termination_manager, "active_terms", ()):
+                        return None
+                    return termination_manager.get_term("task_success").clone()
+
+                def _patched_step(*args, **kwargs):
+                    obs, reward, terminated, truncated, extras = _original_step(*args, **kwargs)
+                    extras = dict(extras) if isinstance(extras, dict) else {}
+                    task_success_at_stage = _get_task_success_at_stage()
+                    if task_success_at_stage is not None:
+                        extras["task_success_at_stage"] = task_success_at_stage
+                    return obs, reward, terminated, truncated, extras
+
+                env.step = _patched_step
 
                 return env, sim_app
 

@@ -104,7 +104,7 @@ env:
     group_size: 1
     reward_coef: 1.0
     use_fixed_reset_state_ids: True
-    max_steps_per_rollout_epoch: 128
+    max_steps_per_rollout_epoch: 64
     max_episode_steps: 256
     video_cfg:
       save_video: False
