@@ -13,12 +13,12 @@ wget "https://d4i3qtqj3r0z5.cloudfront.net/isaac-sim-standalone%406.0.0-rc.22%2B
 unzip isaac-sim-standalone-6.0.0-rc.22.zip -d isaac-sim-standalone-6.0.0-rc.22
 # Create .pth file
 # Wires Isaac Sim standalone into the conda env so Python can find
-sudo tee "/localhome/local-mingxueg/miniconda3/envs/isaaclab_develop_6.0/lib/python3.12/site-packages/isaacsim-standalone.pth" > /dev/null << 'PTHEOF'
-import os, ctypes, sys; _ir="/localhome/local-mingxueg/mingxue/isaac-sim-standalone-6.0.0-rc.22"; _cl=os.path.join(sys.prefix,"lib"); _sp=os.path.join(sys.prefix,"lib/python3.12/site-packages"); os.environ.setdefault("ISAAC_PATH",_ir); os.environ.setdefault("EXP_PATH",os.path.join(_ir,"apps")); os.environ.setdefault("CARB_APP_PATH",os.path.join(_ir,"kit")); _nv=[os.path.join(_sp,"nvidia",d,"lib") for d in os.listdir(os.path.join(_sp,"nvidia")) if os.path.isdir(os.path.join(_sp,"nvidia",d,"lib"))] if os.path.isdir(os.path.join(_sp,"nvidia")) else []; _lp=os.pathsep.join([_cl,_ir,os.path.join(_ir,"kit"),os.path.join(_ir,"kit/kernel/plugins"),os.path.join(_ir,"kit/libs/iray"),os.path.join(_ir,"kit/plugins"),os.path.join(_ir,"kit/plugins/carb_gfx"),os.path.join(_ir,"kit/plugins/rtx"),os.path.join(_ir,"kit/plugins/gpu.foundation")]+_nv); os.environ["LD_LIBRARY_PATH"]=_lp+os.pathsep+os.environ.get("LD_LIBRARY_PATH",""); ctypes.CDLL(os.path.join(_cl,"libpython3.12.so.1.0")); ctypes.CDLL(os.path.join(_ir,"kit/libcarb.so"))
-/localhome/local-mingxueg/mingxue/isaac-sim-standalone-6.0.0-rc.22/python_packages
-/localhome/local-mingxueg/mingxue/isaac-sim-standalone-6.0.0-rc.22/exts/isaacsim.simulation_app
-/localhome/local-mingxueg/mingxue/isaac-sim-standalone-6.0.0-rc.22/kit/kernel/py
-/localhome/local-mingxueg/mingxue/isaac-sim-standalone-6.0.0-rc.22/kit/plugins/bindings-python
+tee "/home/nvidia/miniconda3/envs/isaaclab_develop_6.0/lib/python3.12/site-packages/isaacsim-standalone.pth" > /dev/null << 'PTHEOF'
+import os, ctypes, sys; _ir="/home/nvidia/workspace/yiheng/isaac-sim-standalone-6.0.0-rc.22"; _cl=os.path.join(sys.prefix,"lib"); _sp=os.path.join(sys.prefix,"lib/python3.12/site-packages"); os.environ.setdefault("ISAAC_PATH",_ir); os.environ.setdefault("EXP_PATH",os.path.join(_ir,"apps")); os.environ.setdefault("CARB_APP_PATH",os.path.join(_ir,"kit")); _nv=[os.path.join(_sp,"nvidia",d,"lib") for d in os.listdir(os.path.join(_sp,"nvidia")) if os.path.isdir(os.path.join(_sp,"nvidia",d,"lib"))] if os.path.isdir(os.path.join(_sp,"nvidia")) else []; _lp=os.pathsep.join([_cl,_ir,os.path.join(_ir,"kit"),os.path.join(_ir,"kit/kernel/plugins"),os.path.join(_ir,"kit/libs/iray"),os.path.join(_ir,"kit/plugins"),os.path.join(_ir,"kit/plugins/carb_gfx"),os.path.join(_ir,"kit/plugins/rtx"),os.path.join(_ir,"kit/plugins/gpu.foundation")]+_nv); os.environ["LD_LIBRARY_PATH"]=_lp+os.pathsep+os.environ.get("LD_LIBRARY_PATH",""); ctypes.CDLL(os.path.join(_cl,"libpython3.12.so.1.0")); ctypes.CDLL(os.path.join(_ir,"kit/libcarb.so"))
+/home/nvidia/workspace/yiheng/isaac-sim-standalone-6.0.0-rc.22/python_packages
+/home/nvidia/workspace/yiheng/isaac-sim-standalone-6.0.0-rc.22/exts/isaacsim.simulation_app
+/home/nvidia/workspace/yiheng/isaac-sim-standalone-6.0.0-rc.22/kit/kernel/py
+/home/nvidia/workspace/yiheng/isaac-sim-standalone-6.0.0-rc.22/kit/plugins/bindings-python
 PTHEOF
 
 # ---- 2. IsaacLab ----
@@ -28,6 +28,13 @@ cd IsaacLab
 #### develop branch commit ####
 git switch develop
 git checkout e8d0f67689f
+
+
+export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+export PIP_EXTRA_INDEX_URL=https://pypi.nvidia.com
+export PIP_FIND_LINKS=
+export PIP_RETRIES=1
+export PIP_TIMEOUT=10
 
 ./isaaclab.sh -i
 
@@ -46,10 +53,10 @@ pip install -e "source/isaaclab_contrib[rlinf]" --ignore-requires-python
 export CUDA_HOME=/usr/local/cuda-12.8
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH}"
-MAX_JOBS=128 pip install flash-attn==2.8.3 --no-build-isolation --force-reinstall --no-deps
+MAX_JOBS=24 pip install flash-attn==2.8.3 --no-build-isolation --force-reinstall --no-deps
 
 # ---- IsaacSim env vars (needed by AppLauncher) ----
-export ISAAC_PATH=/localhome/local-mingxueg/mingxue/isaac-sim-standalone-6.0.0-rc.22
+export ISAAC_PATH=/home/nvidia/workspace/yiheng/isaac-sim-standalone-6.0.0-rc.22
 export EXP_PATH=$ISAAC_PATH/apps
 export CARB_APP_PATH=$ISAAC_PATH/kit
 

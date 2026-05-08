@@ -4,16 +4,17 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Train a task-complete MLP classifier on GR00T backbone features.
+"""Train a task-progress MLP regressor on GR00T backbone features.
 
 Usage:
     python train_task_complete_classifier.py \
         --features_dir /localhome/local-vennw/code/task_complete_features \
-        --output_dir   /localhome/local-vennw/code/task_complete_classifier \
+        --output_dir   /localhome/local-vennw/code/task_complete_regressor \
         --epochs 50
 
-The classifier takes (backbone_feature, task_one_hot) as input and outputs
-P(task_complete). At inference, feed current GR00T backbone features + task idx.
+The regressor takes (backbone_feature, task_one_hot) as input and outputs
+episode progress in [0, 1]. At inference, feed current GR00T backbone
+features + task idx.
 """
 
 from __future__ import annotations
@@ -25,11 +26,11 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, TensorDataset
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--features_dir", default="/localhome/local-vennw/code/task_complete_features")
-parser.add_argument("--output_dir", default="/localhome/local-vennw/code/task_complete_classifier")
+parser.add_argument("--output_dir", default="/localhome/local-vennw/code/task_complete_regressor")
 parser.add_argument("--epochs", type=int, default=50)
 parser.add_argument("--lr", type=float, default=1e-3)
 parser.add_argument("--batch_size", type=int, default=512)
@@ -48,8 +49,10 @@ os.makedirs(args.output_dir, exist_ok=True)
 # ---------------------------------------------------------------------------
 print(f"[INFO] Loading features from {args.features_dir}")
 features = np.load(os.path.join(args.features_dir, "features.npy"))   # (N, D)
-labels   = np.load(os.path.join(args.features_dir, "labels.npy"))     # (N,)
+labels   = np.load(os.path.join(args.features_dir, "labels.npy"))     # (N,) progress in [0, 1]
 task_idx = np.load(os.path.join(args.features_dir, "task_index.npy")) # (N,)
+episode_index_path = os.path.join(args.features_dir, "episode_index.npy")
+episode_idx = np.load(episode_index_path) if os.path.exists(episode_index_path) else None
 
 with open(os.path.join(args.features_dir, "meta.json")) as f:
     meta = json.load(f)
@@ -57,25 +60,23 @@ with open(os.path.join(args.features_dir, "meta.json")) as f:
 N, feat_dim = features.shape
 n_tasks = 5
 print(f"  Samples: {N}  feature_dim: {feat_dim}")
-print(f"  Positive: {labels.sum()}  Negative: {(labels == 0).sum()}")
+print(f"  Progress: min={labels.min():.4f} mean={labels.mean():.4f} max={labels.max():.4f}")
 for i in range(n_tasks):
     mask = task_idx == i
-    print(f"  Task {i}: {mask.sum()} samples, {(labels[mask] == 1).sum()} positive")
+    label_mean = labels[mask].mean() if mask.any() else 0.0
+    print(f"  Task {i}: {mask.sum()} samples, mean_progress={label_mean:.4f}")
 
 # ---------------------------------------------------------------------------
 # Train / val split — split by episode block to avoid data leakage.
-# Frames within the same episode are sequential; we split the first val_frac
-# of unique episode boundaries off as validation.
+# Frames within the same episode are sequential; use the saved episode_index
+# from feature extraction when available.
 # ---------------------------------------------------------------------------
-# Approximate: each episode is ~30 frames. Group by contiguous blocks.
-# Simple approach: split frame indices rather than episode indices since we
-# don't have episode_id saved. Use a random 85/15 split at the episode level
-# approximated by frame blocks.
-frames_per_ep = int(np.round(N / meta["n_samples"] * N / 2300)) if meta["n_samples"] > 0 else 30
-frames_per_ep = max(frames_per_ep, 1)
-
-n_episodes_approx = N // frames_per_ep + 1
-episode_ids = np.arange(N) // frames_per_ep    # coarse episode grouping
+if episode_idx is not None:
+    episode_ids = episode_idx
+else:
+    frames_per_ep = int(np.round(N / meta.get("n_episodes", 2300))) if meta.get("n_episodes", 0) else 30
+    frames_per_ep = max(frames_per_ep, 1)
+    episode_ids = np.arange(N) // frames_per_ep
 
 unique_eps = np.unique(episode_ids)
 np.random.shuffle(unique_eps)
@@ -93,8 +94,8 @@ X_val = torch.tensor(features[val_mask], dtype=torch.float32)
 y_val = torch.tensor(labels[val_mask],   dtype=torch.float32)
 t_val = torch.tensor(task_idx[val_mask], dtype=torch.long)
 
-print(f"\n  Train: {len(X_train)} samples ({y_train.sum().int()} pos)")
-print(f"  Val:   {len(X_val)} samples ({y_val.sum().int()} pos)")
+print(f"\n  Train: {len(X_train)} samples, mean_progress={y_train.mean().item():.4f}")
+print(f"  Val:   {len(X_val)} samples, mean_progress={y_val.mean().item():.4f}")
 
 # One-hot encode task
 def make_onehot(task_ids: torch.Tensor, n: int) -> torch.Tensor:
@@ -106,18 +107,10 @@ oh_val   = make_onehot(t_val,   n_tasks)
 X_train_full = torch.cat([X_train, oh_train], dim=-1)  # (N, D+5)
 X_val_full   = torch.cat([X_val,   oh_val],   dim=-1)
 
-# Weighted sampler to handle class imbalance
-pos_count = y_train.sum().item()
-neg_count = len(y_train) - pos_count
-sample_weights = torch.where(y_train == 1,
-                              torch.tensor(neg_count / pos_count),
-                              torch.tensor(1.0))
-sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
-
 train_ds = TensorDataset(X_train_full, y_train)
 val_ds   = TensorDataset(X_val_full,   y_val)
 
-train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler)
+train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
 val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
 
 # ---------------------------------------------------------------------------
@@ -125,7 +118,7 @@ val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
 # ---------------------------------------------------------------------------
 input_dim = feat_dim + n_tasks
 
-class TaskCompleteClassifier(nn.Module):
+class TaskProgressRegressor(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -141,14 +134,13 @@ class TaskCompleteClassifier(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)  # (B,) logits
+        return torch.sigmoid(self.net(x).squeeze(-1))  # (B,) progress in [0, 1]
 
-model = TaskCompleteClassifier(input_dim, args.hidden_dim).to(args.device)
+model = TaskProgressRegressor(input_dim, args.hidden_dim).to(args.device)
 print(f"\n[INFO] Model: input_dim={input_dim}, hidden={args.hidden_dim}")
 print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
 
-pos_weight = torch.tensor(neg_count / pos_count, device=args.device)
-criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+criterion = nn.SmoothL1Loss(beta=0.05)
 optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
@@ -157,29 +149,26 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epo
 # ---------------------------------------------------------------------------
 def evaluate(loader):
     model.eval()
-    total_loss = correct = total = tp = fp = fn = 0
+    total_loss = total_abs = total_sq = total = 0
     with torch.no_grad():
         for xb, yb in loader:
             xb, yb = xb.to(args.device), yb.to(args.device)
-            logits = model(xb)
-            loss = criterion(logits, yb)
+            preds = model(xb)
+            loss = criterion(preds, yb)
             total_loss += loss.item() * len(yb)
-            preds = (logits.sigmoid() >= 0.5).float()
-            correct += (preds == yb).sum().item()
+            err = preds - yb
+            total_abs += err.abs().sum().item()
+            total_sq += (err ** 2).sum().item()
             total += len(yb)
-            tp += ((preds == 1) & (yb == 1)).sum().item()
-            fp += ((preds == 1) & (yb == 0)).sum().item()
-            fn += ((preds == 0) & (yb == 1)).sum().item()
-    precision = tp / (tp + fp + 1e-8)
-    recall    = tp / (tp + fn + 1e-8)
-    f1 = 2 * precision * recall / (precision + recall + 1e-8)
-    return total_loss / total, correct / total, precision, recall, f1
+    mae = total_abs / total
+    rmse = (total_sq / total) ** 0.5
+    return total_loss / total, mae, rmse
 
-best_f1 = 0.0
+best_mae = float("inf")
 best_epoch = 0
 
-print(f"\n{'Epoch':>5} {'train_loss':>10} {'val_loss':>8} {'acc':>6} {'prec':>6} {'rec':>6} {'f1':>6}")
-print("-" * 55)
+print(f"\n{'Epoch':>5} {'train_loss':>10} {'val_loss':>8} {'mae':>8} {'rmse':>8}")
+print("-" * 48)
 
 for epoch in range(1, args.epochs + 1):
     model.train()
@@ -194,11 +183,11 @@ for epoch in range(1, args.epochs + 1):
     train_loss /= len(train_ds)
     scheduler.step()
 
-    val_loss, acc, prec, rec, f1 = evaluate(val_loader)
-    print(f"{epoch:>5d} {train_loss:>10.4f} {val_loss:>8.4f} {acc:>6.3f} {prec:>6.3f} {rec:>6.3f} {f1:>6.3f}")
+    val_loss, mae, rmse = evaluate(val_loader)
+    print(f"{epoch:>5d} {train_loss:>10.4f} {val_loss:>8.4f} {mae:>8.4f} {rmse:>8.4f}")
 
-    if f1 > best_f1:
-        best_f1 = f1
+    if mae < best_mae:
+        best_mae = mae
         best_epoch = epoch
         torch.save({
             "model_state": model.state_dict(),
@@ -206,32 +195,33 @@ for epoch in range(1, args.epochs + 1):
             "feat_dim": feat_dim,
             "hidden_dim": args.hidden_dim,
             "n_tasks": n_tasks,
-            "best_f1": best_f1,
+            "best_mae": best_mae,
             "epoch": epoch,
+            "output_kind": "episode_progress",
         }, os.path.join(args.output_dir, "best_model.pt"))
 
-print(f"\n[DONE] Best F1={best_f1:.4f} at epoch {best_epoch}")
+print(f"\n[DONE] Best MAE={best_mae:.4f} at epoch {best_epoch}")
 print(f"       Saved to {args.output_dir}/best_model.pt")
 
 # Per-task val stats
-print("\nPer-task validation (best threshold=0.5):")
+print("\nPer-task validation:")
 model.load_state_dict(torch.load(os.path.join(args.output_dir, "best_model.pt"))["model_state"])
 model.eval()
 with torch.no_grad():
-    all_logits = model(X_val_full.to(args.device)).cpu()
-    all_preds = (all_logits.sigmoid() >= 0.5).float()
+    all_preds = model(X_val_full.to(args.device)).cpu()
 
 TASK_NAMES = ["left hand pick up", "right hand pick up", "align trocars", "install trocar", "place trocar"]
 for i in range(n_tasks):
     mask = t_val == i
-    if mask.sum() == 0:
+    n_task = int(mask.sum().item())
+    if n_task == 0:
         continue
     yb = y_val[mask]
     pb = all_preds[mask]
-    tp = ((pb == 1) & (yb == 1)).sum().item()
-    fp = ((pb == 1) & (yb == 0)).sum().item()
-    fn = ((pb == 0) & (yb == 1)).sum().item()
-    prec = tp / (tp + fp + 1e-8)
-    rec  = tp / (tp + fn + 1e-8)
-    f1   = 2 * prec * rec / (prec + rec + 1e-8)
-    print(f"  Task {i+1} ({TASK_NAMES[i]:<20}): n={mask.sum():4d} pos={yb.sum().int():3d}  P={prec:.3f} R={rec:.3f} F1={f1:.3f}")
+    err = pb - yb
+    mae = err.abs().mean().item()
+    rmse = torch.sqrt((err ** 2).mean()).item()
+    print(
+        f"  Task {i+1} ({TASK_NAMES[i]:<20}): n={n_task:4d} "
+        f"MAE={mae:.4f} RMSE={rmse:.4f} pred_mean={pb.mean().item():.4f}"
+    )

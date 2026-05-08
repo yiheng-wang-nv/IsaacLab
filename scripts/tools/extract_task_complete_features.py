@@ -4,7 +4,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Extract GR00T backbone features for task-complete classifier training.
+"""Extract GR00T backbone features for task progress regressor training.
 
 Usage:
     python extract_task_complete_features.py \
@@ -14,10 +14,11 @@ Usage:
         --device cuda:0
 
 Output:
-    {output_dir}/features.npy    -- (N, hidden_dim) float32
-    {output_dir}/labels.npy      -- (N,) int32  0=incomplete 1=complete
-    {output_dir}/task_index.npy  -- (N,) int32  0-4
-    {output_dir}/meta.json       -- dataset stats
+    {output_dir}/features.npy       -- (N, hidden_dim) float32
+    {output_dir}/labels.npy         -- (N,) float32 progress in [0, 1]
+    {output_dir}/task_index.npy     -- (N,) int32  0-4
+    {output_dir}/episode_index.npy  -- (N,) int32
+    {output_dir}/meta.json          -- dataset stats
 """
 
 from __future__ import annotations
@@ -45,22 +46,26 @@ parser.add_argument(
             "/checkpoint-100000",
 )
 parser.add_argument(
+    "--gr00t_root",
+    default=None,
+    help="Path to the Isaac-GR00T repository that contains gr00t_config.py.",
+)
+parser.add_argument(
     "--dataset",
     default="/localhome/local-vennw/code/trocar_success_lt_7s_split_by_stage_task_complete",
 )
 parser.add_argument("--output_dir", default="/localhome/local-vennw/code/task_complete_features")
 parser.add_argument("--device", default="cuda:0")
 parser.add_argument("--batch_size", type=int, default=16)
-parser.add_argument(
-    "--label_threshold",
-    type=float,
-    default=0.5,
-    help="Frames with soft task_complete > this value are labelled as positive (1).",
-)
 parser.add_argument("--max_episodes", type=int, default=None, help="Cap episodes for quick testing.")
 args = parser.parse_args()
 
-GROOT_ROOT = Path(args.checkpoint).parents[1]
+GROOT_ROOT = Path(args.gr00t_root) if args.gr00t_root else Path(args.checkpoint).parents[1]
+if not (GROOT_ROOT / "gr00t_config.py").exists():
+    raise FileNotFoundError(
+        f"Could not find gr00t_config.py under {GROOT_ROOT}. "
+        "Pass --gr00t_root /path/to/Isaac-GR00T."
+    )
 sys.path.insert(0, str(GROOT_ROOT))
 
 # ---------------------------------------------------------------------------
@@ -166,10 +171,11 @@ if args.max_episodes:
     parquet_files = parquet_files[: args.max_episodes]
 
 all_features: list[np.ndarray] = []
-all_labels: list[int] = []
+all_labels: list[float] = []
 all_task_indices: list[int] = []
+all_episode_indices: list[int] = []
 
-for parquet_path in tqdm(parquet_files, desc="Episodes"):
+for episode_idx, parquet_path in enumerate(tqdm(parquet_files, desc="Episodes")):
     df = pd.read_parquet(parquet_path)
     n_frames = len(df)
     if n_frames == 0:
@@ -179,10 +185,12 @@ for parquet_path in tqdm(parquet_files, desc="Episodes"):
     task_idx = int(df["task_index"].iloc[0])
     task_desc = task_idx_to_desc.get(task_idx, TASK_DESCRIPTIONS[task_idx])
 
-    # Soft task_complete label (last column of action)
-    actions = np.array(df["action"].tolist(), dtype=np.float32)   # (T, 29)
-    soft_tc = actions[:, -1]                                        # (T,)
-    hard_labels = (soft_tc > args.label_threshold).astype(np.int32)
+    # Progress label: frame i in an episode of length T gets i / (T - 1).
+    # Example: T=30 -> 0/29, 1/29, ..., 29/29.
+    if n_frames == 1:
+        progress_labels = np.ones(1, dtype=np.float32)
+    else:
+        progress_labels = np.arange(n_frames, dtype=np.float32) / float(n_frames - 1)
 
     # States — (T, 28) float32
     states = np.array(df["observation.state"].tolist(), dtype=np.float32)  # (T, 28)
@@ -218,8 +226,9 @@ for parquet_path in tqdm(parquet_files, desc="Episodes"):
         feat = _backbone_out["features"]               # (1, n_tokens, hidden)
         feat_pooled = feat.mean(dim=1).cpu().numpy()   # (1, hidden)
         all_features.append(feat_pooled)
-        all_labels.append(int(hard_labels[i]))
+        all_labels.append(float(progress_labels[i]))
         all_task_indices.append(task_idx)
+        all_episode_indices.append(episode_idx)
 
 # ---------------------------------------------------------------------------
 # Save
@@ -227,25 +236,30 @@ for parquet_path in tqdm(parquet_files, desc="Episodes"):
 os.makedirs(args.output_dir, exist_ok=True)
 
 features_np = np.concatenate(all_features, axis=0).astype(np.float32)
-labels_np = np.array(all_labels, dtype=np.int32)
+labels_np = np.array(all_labels, dtype=np.float32)
 task_np = np.array(all_task_indices, dtype=np.int32)
+episode_np = np.array(all_episode_indices, dtype=np.int32)
 
 np.save(os.path.join(args.output_dir, "features.npy"), features_np)
 np.save(os.path.join(args.output_dir, "labels.npy"), labels_np)
 np.save(os.path.join(args.output_dir, "task_index.npy"), task_np)
+np.save(os.path.join(args.output_dir, "episode_index.npy"), episode_np)
 
 meta = {
     "n_samples": int(len(labels_np)),
-    "n_positive": int(labels_np.sum()),
-    "n_negative": int((labels_np == 0).sum()),
+    "n_episodes": int(len(np.unique(episode_np))),
     "feature_dim": int(features_np.shape[1]),
-    "label_threshold": args.label_threshold,
+    "label_type": "linear_episode_progress",
+    "label_min": float(labels_np.min()),
+    "label_max": float(labels_np.max()),
+    "label_mean": float(labels_np.mean()),
     "checkpoint": args.checkpoint,
     "dataset": args.dataset,
     "per_task": {
         str(i): {
             "n": int((task_np == i).sum()),
-            "n_pos": int(((task_np == i) & (labels_np == 1)).sum()),
+            "n_episodes": int(len(np.unique(episode_np[task_np == i]))),
+            "label_mean": float(labels_np[task_np == i].mean()) if (task_np == i).any() else 0.0,
         }
         for i in range(5)
     },
@@ -254,9 +268,11 @@ with open(os.path.join(args.output_dir, "meta.json"), "w") as f:
     json.dump(meta, f, indent=2)
 
 print(f"\n[DONE] Saved {len(labels_np)} samples to {args.output_dir}")
-print(f"  Positive: {labels_np.sum()}  Negative: {(labels_np == 0).sum()}")
+print(f"  Episodes: {len(np.unique(episode_np))}")
+print(f"  Progress label: min={labels_np.min():.4f} mean={labels_np.mean():.4f} max={labels_np.max():.4f}")
 print(f"  Feature dim: {features_np.shape[1]}")
 for i, desc in enumerate(TASK_DESCRIPTIONS):
     n = (task_np == i).sum()
-    p = ((task_np == i) & (labels_np == 1)).sum()
-    print(f"  Task {i+1} ({desc}): {n} samples, {p} positive")
+    ep = len(np.unique(episode_np[task_np == i]))
+    label_mean = labels_np[task_np == i].mean() if n else 0.0
+    print(f"  Task {i+1} ({desc}): {n} samples, {ep} episodes, mean_progress={label_mean:.4f}")
