@@ -37,6 +37,12 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Run an interactive GUI for the task-complete trocar policy.")
 parser.add_argument("--model_path", type=str, required=True, help="Path to the Isaac-GR00T checkpoint directory.")
 parser.add_argument(
+    "--gr00t_root",
+    type=str,
+    default=None,
+    help="Path to the Isaac-GR00T repository that contains gr00t_config.py.",
+)
+parser.add_argument(
     "--task_id",
     type=str,
     default="Isaac-Assemble-Trocar-G129-Dex3-RLinf-v0",
@@ -230,7 +236,12 @@ def _print_controls() -> None:
     print("  H : print this help again")
 
 
-def _find_isaac_gr00t_root(model_path: Path) -> Path:
+def _find_isaac_gr00t_root(model_path: Path, gr00t_root: str | None = None) -> Path:
+    if gr00t_root is not None:
+        candidate = Path(gr00t_root).expanduser().resolve()
+        if (candidate / "gr00t_config.py").exists() and (candidate / "gr00t" / "model" / "policy.py").exists():
+            return candidate
+        raise FileNotFoundError(f"Could not locate Isaac-GR00T root at {candidate}.")
     for candidate in [model_path, *model_path.parents]:
         if (candidate / "gr00t_config.py").exists() and (candidate / "gr00t" / "model" / "policy.py").exists():
             return candidate
@@ -242,7 +253,7 @@ def _find_isaac_gr00t_root(model_path: Path) -> Path:
 
 def _load_policy(model_path: str, model_device: str, denoising_steps: int):
     model_path_obj = Path(model_path).expanduser().resolve()
-    isaac_gr00t_root = _find_isaac_gr00t_root(model_path_obj)
+    isaac_gr00t_root = _find_isaac_gr00t_root(model_path_obj, args.gr00t_root)
     if str(isaac_gr00t_root) not in sys.path:
         sys.path.insert(0, str(isaac_gr00t_root))
 

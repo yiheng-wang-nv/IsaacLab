@@ -51,6 +51,8 @@ print(f"[INFO] Loading features from {args.features_dir}")
 features = np.load(os.path.join(args.features_dir, "features.npy"))   # (N, D)
 labels   = np.load(os.path.join(args.features_dir, "labels.npy"))     # (N,) progress in [0, 1]
 task_idx = np.load(os.path.join(args.features_dir, "task_index.npy")) # (N,)
+source_task_index_path = os.path.join(args.features_dir, "source_task_index.npy")
+source_task_idx = np.load(source_task_index_path) if os.path.exists(source_task_index_path) else task_idx
 episode_index_path = os.path.join(args.features_dir, "episode_index.npy")
 episode_idx = np.load(episode_index_path) if os.path.exists(episode_index_path) else None
 
@@ -61,6 +63,7 @@ N, feat_dim = features.shape
 n_tasks = 5
 print(f"  Samples: {N}  feature_dim: {feat_dim}")
 print(f"  Progress: min={labels.min():.4f} mean={labels.mean():.4f} max={labels.max():.4f}")
+print(f"  Source-prompt samples: {(task_idx == source_task_idx).sum()}  Cross negatives: {(task_idx != source_task_idx).sum()}")
 for i in range(n_tasks):
     mask = task_idx == i
     label_mean = labels[mask].mean() if mask.any() else 0.0
@@ -89,10 +92,12 @@ train_mask = ~val_mask
 X_train = torch.tensor(features[train_mask], dtype=torch.float32)
 y_train = torch.tensor(labels[train_mask],   dtype=torch.float32)
 t_train = torch.tensor(task_idx[train_mask], dtype=torch.long)
+s_train = torch.tensor(source_task_idx[train_mask], dtype=torch.long)
 
 X_val = torch.tensor(features[val_mask], dtype=torch.float32)
 y_val = torch.tensor(labels[val_mask],   dtype=torch.float32)
 t_val = torch.tensor(task_idx[val_mask], dtype=torch.long)
+s_val = torch.tensor(source_task_idx[val_mask], dtype=torch.long)
 
 print(f"\n  Train: {len(X_train)} samples, mean_progress={y_train.mean().item():.4f}")
 print(f"  Val:   {len(X_val)} samples, mean_progress={y_val.mean().item():.4f}")
@@ -107,8 +112,23 @@ oh_val   = make_onehot(t_val,   n_tasks)
 X_train_full = torch.cat([X_train, oh_train], dim=-1)  # (N, D+5)
 X_val_full   = torch.cat([X_val,   oh_val],   dim=-1)
 
-train_ds = TensorDataset(X_train_full, y_train)
-val_ds   = TensorDataset(X_val_full,   y_val)
+def make_sample_weights(prompt_task: torch.Tensor, source_task: torch.Tensor) -> torch.Tensor:
+    """Balance source-prompt progress samples and cross-task negative samples."""
+    is_cross = prompt_task != source_task
+    n_total = len(prompt_task)
+    n_cross = int(is_cross.sum().item())
+    n_source = n_total - n_cross
+    weights = torch.ones(n_total, dtype=torch.float32)
+    if n_source > 0 and n_cross > 0:
+        weights[~is_cross] = n_total / (2.0 * n_source)
+        weights[is_cross] = n_total / (2.0 * n_cross)
+    return weights
+
+
+w_train = make_sample_weights(t_train, s_train)
+
+train_ds = TensorDataset(X_train_full, y_train, w_train)
+val_ds   = TensorDataset(X_val_full,   y_val, t_val, s_val)
 
 train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
 val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
@@ -140,7 +160,7 @@ model = TaskProgressRegressor(input_dim, args.hidden_dim).to(args.device)
 print(f"\n[INFO] Model: input_dim={input_dim}, hidden={args.hidden_dim}")
 print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
 
-criterion = nn.SmoothL1Loss(beta=0.05)
+criterion = nn.SmoothL1Loss(beta=0.05, reduction="none")
 optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
@@ -150,44 +170,58 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epo
 def evaluate(loader):
     model.eval()
     total_loss = total_abs = total_sq = total = 0
+    source_abs = source_total = cross_abs = cross_total = 0
     with torch.no_grad():
-        for xb, yb in loader:
+        for xb, yb, tb, sb in loader:
             xb, yb = xb.to(args.device), yb.to(args.device)
             preds = model(xb)
-            loss = criterion(preds, yb)
+            loss = criterion(preds, yb).mean()
             total_loss += loss.item() * len(yb)
             err = preds - yb
             total_abs += err.abs().sum().item()
             total_sq += (err ** 2).sum().item()
             total += len(yb)
+            is_cross = tb != sb
+            if (~is_cross).any():
+                source_abs += err[~is_cross.to(err.device)].abs().sum().item()
+                source_total += int((~is_cross).sum().item())
+            if is_cross.any():
+                cross_abs += err[is_cross.to(err.device)].abs().sum().item()
+                cross_total += int(is_cross.sum().item())
     mae = total_abs / total
     rmse = (total_sq / total) ** 0.5
-    return total_loss / total, mae, rmse
+    source_mae = source_abs / source_total if source_total > 0 else mae
+    cross_mae = cross_abs / cross_total if cross_total > 0 else mae
+    balanced_mae = 0.5 * (source_mae + cross_mae)
+    return total_loss / total, mae, rmse, source_mae, cross_mae, balanced_mae
 
 best_mae = float("inf")
 best_epoch = 0
 
-print(f"\n{'Epoch':>5} {'train_loss':>10} {'val_loss':>8} {'mae':>8} {'rmse':>8}")
-print("-" * 48)
+print(f"\n{'Epoch':>5} {'train_loss':>10} {'val_loss':>8} {'mae':>8} {'rmse':>8} {'src_mae':>8} {'xneg_mae':>9} {'bal_mae':>8}")
+print("-" * 78)
 
 for epoch in range(1, args.epochs + 1):
     model.train()
     train_loss = 0.0
-    for xb, yb in train_loader:
-        xb, yb = xb.to(args.device), yb.to(args.device)
+    for xb, yb, wb in train_loader:
+        xb, yb, wb = xb.to(args.device), yb.to(args.device), wb.to(args.device)
         optimizer.zero_grad()
-        loss = criterion(model(xb), yb)
+        loss = (criterion(model(xb), yb) * wb).mean()
         loss.backward()
         optimizer.step()
         train_loss += loss.item() * len(yb)
     train_loss /= len(train_ds)
     scheduler.step()
 
-    val_loss, mae, rmse = evaluate(val_loader)
-    print(f"{epoch:>5d} {train_loss:>10.4f} {val_loss:>8.4f} {mae:>8.4f} {rmse:>8.4f}")
+    val_loss, mae, rmse, source_mae, cross_mae, balanced_mae = evaluate(val_loader)
+    print(
+        f"{epoch:>5d} {train_loss:>10.4f} {val_loss:>8.4f} {mae:>8.4f} {rmse:>8.4f} "
+        f"{source_mae:>8.4f} {cross_mae:>9.4f} {balanced_mae:>8.4f}"
+    )
 
-    if mae < best_mae:
-        best_mae = mae
+    if balanced_mae < best_mae:
+        best_mae = balanced_mae
         best_epoch = epoch
         torch.save({
             "model_state": model.state_dict(),
@@ -195,12 +229,15 @@ for epoch in range(1, args.epochs + 1):
             "feat_dim": feat_dim,
             "hidden_dim": args.hidden_dim,
             "n_tasks": n_tasks,
-            "best_mae": best_mae,
+            "best_balanced_mae": best_mae,
+            "val_mae": mae,
+            "val_source_mae": source_mae,
+            "val_cross_negative_mae": cross_mae,
             "epoch": epoch,
             "output_kind": "episode_progress",
         }, os.path.join(args.output_dir, "best_model.pt"))
 
-print(f"\n[DONE] Best MAE={best_mae:.4f} at epoch {best_epoch}")
+print(f"\n[DONE] Best balanced MAE={best_mae:.4f} at epoch {best_epoch}")
 print(f"       Saved to {args.output_dir}/best_model.pt")
 
 # Per-task val stats

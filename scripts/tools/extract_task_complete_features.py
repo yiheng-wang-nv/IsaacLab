@@ -14,11 +14,12 @@ Usage:
         --device cuda:0
 
 Output:
-    {output_dir}/features.npy       -- (N, hidden_dim) float32
-    {output_dir}/labels.npy         -- (N,) float32 progress in [0, 1]
-    {output_dir}/task_index.npy     -- (N,) int32  0-4
-    {output_dir}/episode_index.npy  -- (N,) int32
-    {output_dir}/meta.json          -- dataset stats
+    {output_dir}/features.npy           -- (N, hidden_dim) float32
+    {output_dir}/labels.npy             -- (N,) float32 progress in [0, 1]
+    {output_dir}/task_index.npy         -- (N,) int32 prompt task index 0-4
+    {output_dir}/source_task_index.npy  -- (N,) int32 original episode task index 0-4
+    {output_dir}/episode_index.npy      -- (N,) int32
+    {output_dir}/meta.json              -- dataset stats
 """
 
 from __future__ import annotations
@@ -58,6 +59,21 @@ parser.add_argument("--output_dir", default="/localhome/local-vennw/code/task_co
 parser.add_argument("--device", default="cuda:0")
 parser.add_argument("--batch_size", type=int, default=16)
 parser.add_argument("--max_episodes", type=int, default=None, help="Cap episodes for quick testing.")
+parser.add_argument(
+    "--cross_task_negatives",
+    action="store_true",
+    help="Also extract features with non-source task prompts and label them as 0 progress.",
+)
+parser.add_argument(
+    "--neighbor_exclusion_frac",
+    type=float,
+    default=0.10,
+    help=(
+        "For adjacent task prompt negatives, drop the closest boundary fraction: "
+        "source task i -> prompt i+1 uses progress <= 1-frac; "
+        "source task i -> prompt i-1 uses progress >= frac."
+    ),
+)
 args = parser.parse_args()
 
 GROOT_ROOT = Path(args.gr00t_root) if args.gr00t_root else Path(args.checkpoint).parents[1]
@@ -173,6 +189,7 @@ if args.max_episodes:
 all_features: list[np.ndarray] = []
 all_labels: list[float] = []
 all_task_indices: list[int] = []
+all_source_task_indices: list[int] = []
 all_episode_indices: list[int] = []
 
 for episode_idx, parquet_path in enumerate(tqdm(parquet_files, desc="Episodes")):
@@ -219,16 +236,36 @@ for episode_idx, parquet_path in enumerate(tqdm(parquet_files, desc="Episodes"))
     # The hook on policy.model.backbone captures backbone_features after each call.
     for i in range(n_frames):
         images = {v_key: video_frames[v_key][i] for v_key in VIDEO_KEYS}
-        obs = _build_obs(images, states[i], task_desc)
-        with torch.no_grad():
-            policy.get_action(obs)
+        progress = float(progress_labels[i])
+        prompt_label_pairs = [(task_idx, progress)]
 
-        feat = _backbone_out["features"]               # (1, n_tokens, hidden)
-        feat_pooled = feat.mean(dim=1).cpu().numpy()   # (1, hidden)
-        all_features.append(feat_pooled)
-        all_labels.append(float(progress_labels[i]))
-        all_task_indices.append(task_idx)
-        all_episode_indices.append(episode_idx)
+        if args.cross_task_negatives:
+            for prompt_task_idx in range(len(TASK_DESCRIPTIONS)):
+                if prompt_task_idx == task_idx:
+                    continue
+
+                include_negative = True
+                if prompt_task_idx == task_idx + 1:
+                    include_negative = progress <= 1.0 - args.neighbor_exclusion_frac
+                elif prompt_task_idx == task_idx - 1:
+                    include_negative = progress >= args.neighbor_exclusion_frac
+
+                if include_negative:
+                    prompt_label_pairs.append((prompt_task_idx, 0.0))
+
+        for prompt_task_idx, label in prompt_label_pairs:
+            prompt_desc = task_idx_to_desc.get(prompt_task_idx, TASK_DESCRIPTIONS[prompt_task_idx])
+            obs = _build_obs(images, states[i], prompt_desc)
+            with torch.no_grad():
+                policy.get_action(obs)
+
+            feat = _backbone_out["features"]               # (1, n_tokens, hidden)
+            feat_pooled = feat.mean(dim=1).cpu().numpy()   # (1, hidden)
+            all_features.append(feat_pooled)
+            all_labels.append(float(label))
+            all_task_indices.append(prompt_task_idx)
+            all_source_task_indices.append(task_idx)
+            all_episode_indices.append(episode_idx)
 
 # ---------------------------------------------------------------------------
 # Save
@@ -238,18 +275,27 @@ os.makedirs(args.output_dir, exist_ok=True)
 features_np = np.concatenate(all_features, axis=0).astype(np.float32)
 labels_np = np.array(all_labels, dtype=np.float32)
 task_np = np.array(all_task_indices, dtype=np.int32)
+source_task_np = np.array(all_source_task_indices, dtype=np.int32)
 episode_np = np.array(all_episode_indices, dtype=np.int32)
 
 np.save(os.path.join(args.output_dir, "features.npy"), features_np)
 np.save(os.path.join(args.output_dir, "labels.npy"), labels_np)
 np.save(os.path.join(args.output_dir, "task_index.npy"), task_np)
+np.save(os.path.join(args.output_dir, "source_task_index.npy"), source_task_np)
 np.save(os.path.join(args.output_dir, "episode_index.npy"), episode_np)
+
+positive_mask = task_np == source_task_np
+cross_negative_mask = task_np != source_task_np
 
 meta = {
     "n_samples": int(len(labels_np)),
     "n_episodes": int(len(np.unique(episode_np))),
     "feature_dim": int(features_np.shape[1]),
     "label_type": "linear_episode_progress",
+    "cross_task_negatives": bool(args.cross_task_negatives),
+    "neighbor_exclusion_frac": float(args.neighbor_exclusion_frac),
+    "n_source_prompt_samples": int(positive_mask.sum()),
+    "n_cross_negative_samples": int(cross_negative_mask.sum()),
     "label_min": float(labels_np.min()),
     "label_max": float(labels_np.max()),
     "label_mean": float(labels_np.mean()),
@@ -260,6 +306,7 @@ meta = {
             "n": int((task_np == i).sum()),
             "n_episodes": int(len(np.unique(episode_np[task_np == i]))),
             "label_mean": float(labels_np[task_np == i].mean()) if (task_np == i).any() else 0.0,
+            "n_cross_negative": int(((task_np == i) & cross_negative_mask).sum()),
         }
         for i in range(5)
     },
@@ -269,10 +316,12 @@ with open(os.path.join(args.output_dir, "meta.json"), "w") as f:
 
 print(f"\n[DONE] Saved {len(labels_np)} samples to {args.output_dir}")
 print(f"  Episodes: {len(np.unique(episode_np))}")
+print(f"  Source-prompt samples: {positive_mask.sum()}  Cross-task negatives: {cross_negative_mask.sum()}")
 print(f"  Progress label: min={labels_np.min():.4f} mean={labels_np.mean():.4f} max={labels_np.max():.4f}")
 print(f"  Feature dim: {features_np.shape[1]}")
 for i, desc in enumerate(TASK_DESCRIPTIONS):
     n = (task_np == i).sum()
     ep = len(np.unique(episode_np[task_np == i]))
     label_mean = labels_np[task_np == i].mean() if n else 0.0
-    print(f"  Task {i+1} ({desc}): {n} samples, {ep} episodes, mean_progress={label_mean:.4f}")
+    n_neg = ((task_np == i) & cross_negative_mask).sum()
+    print(f"  Task {i+1} ({desc}): {n} samples, {ep} episodes, negatives={n_neg}, mean_progress={label_mean:.4f}")

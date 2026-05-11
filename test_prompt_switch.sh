@@ -1,0 +1,12 @@
+./isaaclab.sh -p scripts/tools/evaluate_task_progress_prompt_switch.py \
+  --checkpoint /home/nvidia/workspace/yiheng/models/sim6_gr00t_n15_100ksteps_split_stage \
+  --gr00t_root /home/nvidia/workspace/yiheng/IsaacLab/Isaac-GR00T \
+  --dataset /home/nvidia/workspace/yiheng/datasets/trocar_success_lt_7s_split_by_stage_task_complete \
+  --features_dir /home/nvidia/workspace/yiheng/datasets/task_complete_features_cross \
+  --regressor_path /home/nvidia/workspace/yiheng/models/task_progress_regressor_cross/best_model.pt \
+  --device cuda:0 \
+  --max_episodes_per_task 10 \
+  --frame_kinds first,last \
+  --split val \
+  --seed 42 \
+  --val_frac 0.15

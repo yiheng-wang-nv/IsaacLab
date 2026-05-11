@@ -90,9 +90,10 @@ offset_dict = {
     "right_elbow_joint": -0.3,
 }
 
-HEALTHCARE_S3 = "/localhome/local-vennw/models/healthcare_assets/0.5.0/132c82d"
+ASSETS_ROOT = "/home/nvidia/workspace/yiheng/assets"
+HEALTHCARE_S3 = f"{ASSETS_ROOT}/healthcare_assets/0.5.0/132c82d"
 USD_ROOT = f"{HEALTHCARE_S3}/Props/LightWheel"
-BENCHMARK_ASSETS = "/localhome/local-vennw/code/IsaacLab/benchmark_assets"
+ASSEMBLE_TROCAR_ASSETS = f"{ASSETS_ROOT}/sim2real_rlinf_dev_pg/assets/assemble_trocar"
 
 
 @configclass
@@ -118,7 +119,7 @@ class AssembleTrocarSceneCfg(InteractiveSceneCfg):
     trocar_1 = RigidObjectCfg(
         prim_path="/World/envs/env_.*/trocar_1",
         spawn=UsdFileCfg(
-            usd_path="/localhome/local-vennw/code/Trocar004_test.usd",
+            usd_path=f"{ASSEMBLE_TROCAR_ASSETS}/Assets/Trocar002/Trocar004_test_nodeform.usd",
             collision_props=sim_utils.CollisionPropertiesCfg(
                 collision_enabled=True,
                 contact_offset=0.001,
@@ -134,7 +135,7 @@ class AssembleTrocarSceneCfg(InteractiveSceneCfg):
     trocar_2 = RigidObjectCfg(
         prim_path="/World/envs/env_.*/trocar_2",
         spawn=UsdFileCfg(
-            usd_path="/localhome/local-vennw/code/DisposableLaparoscopicPunctureDevice006_test.usd",
+            usd_path=f"{ASSETS_ROOT}/DisposableLaparoscopicPunctureDevice006_test.usd",
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 rigid_body_enabled=True,
                 disable_gravity=False,
