@@ -76,6 +76,30 @@ parser.add_argument(
     help="Predicted task_complete value above which auto-pause triggers.",
 )
 parser.add_argument(
+    "--stage_precondition_threshold",
+    type=float,
+    default=0.95,
+    help="For task N>1, require task N-1 progress to be at least this value before executing task N.",
+)
+parser.add_argument(
+    "--progress_regressor_path",
+    type=str,
+    default=None,
+    help="Optional task-progress regressor checkpoint. If set, use it instead of action.task_complete.",
+)
+parser.add_argument(
+    "--enable_stage_precondition",
+    action="store_true",
+    default=True,
+    help="Gate task N>1 execution on task N-1 progress.",
+)
+parser.add_argument(
+    "--disable_stage_precondition",
+    action="store_false",
+    dest="enable_stage_precondition",
+    help="Disable the previous-task completion gate.",
+)
+parser.add_argument(
     "--enable_task_complete_stop",
     action="store_true",
     default=True,
@@ -251,7 +275,7 @@ def _find_isaac_gr00t_root(model_path: Path, gr00t_root: str | None = None) -> P
     raise FileNotFoundError("Could not locate Isaac-GR00T root.")
 
 
-def _load_policy(model_path: str, model_device: str, denoising_steps: int):
+def _load_policy(model_path: str, model_device: str, denoising_steps: int, progress_regressor_path: str | None = None):
     model_path_obj = Path(model_path).expanduser().resolve()
     isaac_gr00t_root = _find_isaac_gr00t_root(model_path_obj, args.gr00t_root)
     if str(isaac_gr00t_root) not in sys.path:
@@ -276,6 +300,8 @@ def _load_policy(model_path: str, model_device: str, denoising_steps: int):
         embodiment_tag="new_embodiment",
         denoising_steps=denoising_steps,
         device=model_device,
+        progress_regressor_path=progress_regressor_path,
+        progress_task_descriptions=TASK_DESCRIPTIONS,
     )
     return policy
 
@@ -602,7 +628,7 @@ def _convert_policy_action_chunk_to_env(action_dict: dict) -> list[np.ndarray]:
 
 def _extract_task_complete(action_dict: dict) -> float | None:
     """Return the mean task_complete prediction over the action chunk, or None."""
-    value = action_dict.get("action.task_complete")
+    value = action_dict.get("action.task_progress", action_dict.get("action.task_complete"))
     if value is None:
         return None
     if isinstance(value, torch.Tensor):
@@ -610,6 +636,20 @@ def _extract_task_complete(action_dict: dict) -> float | None:
     else:
         arr = np.asarray(value, dtype=np.float32).reshape(-1)
     return float(arr.mean()) if arr.size > 0 else None
+
+
+def _predict_task_progress(action_dict: dict) -> float | None:
+    return _extract_task_complete(action_dict)
+
+
+def _probe_task_progress(policy, env, task_idx: int):
+    task_desc = TASK_DESCRIPTIONS[task_idx]
+    t0 = time.perf_counter()
+    policy_obs = _build_policy_obs(env, task_desc)
+    action_dict = policy.get_action(policy_obs)
+    policy_ms = (time.perf_counter() - t0) * 1000.0
+    progress = _predict_task_progress(action_dict)
+    return action_dict, progress, policy_ms
 
 
 class KeyboardInterface:
@@ -836,7 +876,12 @@ class StatusPanel:
 
 def main():
     model_device = args.model_device or args.device
-    policy = _load_policy(args.model_path, model_device=model_device, denoising_steps=args.denoising_steps)
+    policy = _load_policy(
+        args.model_path,
+        model_device=model_device,
+        denoising_steps=args.denoising_steps,
+        progress_regressor_path=args.progress_regressor_path,
+    )
     env = _create_env(args.task_id, device=args.device)
     rng = np.random.default_rng(args.seed)
 
@@ -951,11 +996,9 @@ def main():
                 else:
                     task_desc = TASK_DESCRIPTIONS[keyboard.selected_task_idx]
                     with torch.inference_mode():
-                        t0 = time.perf_counter()
-                        policy_obs = _build_policy_obs(env, task_desc)
-                        action_dict = policy.get_action(policy_obs)
-                        last_policy_ms = (time.perf_counter() - t0) * 1000.0
-                    task_complete_value = _extract_task_complete(action_dict)
+                        _, task_complete_value, last_policy_ms = _probe_task_progress(
+                            policy, env, keyboard.selected_task_idx
+                        )
                     keyboard.last_message = f"task_complete probe ({task_desc}): {task_complete_value}"
 
             # --- Decide whether to step ---
@@ -985,20 +1028,40 @@ def main():
                 if policy_step_requested:
                     executing_policy_step = True
                     if not cached_policy_actions:
-                        task_desc = TASK_DESCRIPTIONS[keyboard.selected_task_idx]
-                        with torch.inference_mode():
-                            t0 = time.perf_counter()
-                            policy_obs = _build_policy_obs(env, task_desc)
-                            action_dict = policy.get_action(policy_obs)
-                            last_policy_ms = (time.perf_counter() - t0) * 1000.0
-                        task_complete_value = _extract_task_complete(action_dict)
-                        action_chunk = _convert_policy_action_chunk_to_env(action_dict)
-                        if not action_chunk:
-                            raise RuntimeError("Policy returned an empty action chunk.")
-                        cached_policy_actions = [a.copy() for a in action_chunk[: max(args.open_loop_steps, 1)]]
-                        open_loop_steps_remaining = len(cached_policy_actions)
-                    action_np = cached_policy_actions.pop(0)
-                    action_tensor = _raw_action_to_env_tensor(action_np, device=env.device)
+                        selected_task_idx = keyboard.selected_task_idx
+                        if args.enable_stage_precondition and selected_task_idx > 0:
+                            required_prev_task_idx = selected_task_idx - 1
+                            with torch.inference_mode():
+                                _, previous_progress, last_policy_ms = _probe_task_progress(
+                                    policy, env, required_prev_task_idx
+                                )
+                            if previous_progress is None or previous_progress < args.stage_precondition_threshold:
+                                keyboard.running = False
+                                policy_step_requested = False
+                                executing_policy_step = False
+                                should_step = False
+                                cached_policy_actions = []
+                                open_loop_steps_remaining = 0
+                                keyboard.last_message = (
+                                    f"Blocked task {selected_task_idx + 1}: task {required_prev_task_idx + 1} "
+                                    f"progress={previous_progress} < {args.stage_precondition_threshold:.2f}. "
+                                    f"Task {required_prev_task_idx + 1} is not complete."
+                                )
+
+                        if should_step:
+                            task_desc = TASK_DESCRIPTIONS[keyboard.selected_task_idx]
+                            with torch.inference_mode():
+                                action_dict, task_complete_value, last_policy_ms = _probe_task_progress(
+                                    policy, env, keyboard.selected_task_idx
+                                )
+                            action_chunk = _convert_policy_action_chunk_to_env(action_dict)
+                            if not action_chunk:
+                                raise RuntimeError("Policy returned an empty action chunk.")
+                            cached_policy_actions = [a.copy() for a in action_chunk[: max(args.open_loop_steps, 1)]]
+                            open_loop_steps_remaining = len(cached_policy_actions)
+                    if should_step:
+                        action_np = cached_policy_actions.pop(0)
+                        action_tensor = _raw_action_to_env_tensor(action_np, device=env.device)
                 else:
                     # tray hold step — hold current joint positions
                     action_term = env.action_manager.get_term(env.action_manager.active_terms[0])
