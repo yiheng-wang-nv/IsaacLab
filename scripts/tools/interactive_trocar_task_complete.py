@@ -76,6 +76,18 @@ parser.add_argument(
     help="Predicted task_complete value above which auto-pause triggers.",
 )
 parser.add_argument(
+    "--task_complete_peak_threshold",
+    type=float,
+    default=0.90,
+    help="If current task progress once exceeds this value and then drops, treat the task as complete.",
+)
+parser.add_argument(
+    "--task_complete_drop_threshold",
+    type=float,
+    default=0.20,
+    help="Drop threshold used with --task_complete_peak_threshold for hysteresis completion.",
+)
+parser.add_argument(
     "--stage_precondition_threshold",
     type=float,
     default=0.95,
@@ -832,6 +844,7 @@ class StatusPanel:
         self,
         keyboard: KeyboardInterface,
         task_complete_value: float | None,
+        task_complete_peak: float | None,
         step_count: int,
         task_run_step_count: int,
         episode_done: bool,
@@ -850,6 +863,7 @@ class StatusPanel:
             mode += " / TRAY ROTATING"
 
         tc_text = "n/a" if task_complete_value is None else f"{task_complete_value:.4f}"
+        tc_peak_text = "n/a" if task_complete_peak is None else f"{task_complete_peak:.4f}"
         tc_above = (
             "n/a"
             if task_complete_value is None
@@ -862,7 +876,7 @@ class StatusPanel:
         self._status.text = (
             f"Mode: {mode}\n"
             f"Task {keyboard.selected_task_idx + 1}: {task_desc}\n"
-            f"task_complete: {tc_text}  (>= {args.task_complete_threshold:.2f}: {tc_above})\n"
+            f"task_complete: {tc_text}  peak={tc_peak_text}  (>= {args.task_complete_threshold:.2f}: {tc_above})\n"
             f"Auto-stop on TC: {keyboard.stop_on_task_complete}\n"
             f"Task run steps: {task_run_step_count} / {args.task_timeout_steps}\n"
             f"Open-loop steps remaining: {open_loop_steps_remaining} / {args.open_loop_steps}\n"
@@ -916,6 +930,7 @@ def main():
     task_run_step_count = 0
     episode_done = False
     task_complete_value: float | None = None
+    task_complete_peak: float | None = None
     previous_task_idx = keyboard.selected_task_idx
     last_policy_ms: float | None = None
     last_env_step_ms: float | None = None
@@ -936,6 +951,7 @@ def main():
             if keyboard.selected_task_idx != previous_task_idx:
                 previous_task_idx = keyboard.selected_task_idx
                 task_complete_value = None
+                task_complete_peak = None
                 task_run_step_count = 0
                 cached_policy_actions = []
                 open_loop_steps_remaining = 0
@@ -951,6 +967,7 @@ def main():
                 task_run_step_count = 0
                 episode_done = False
                 task_complete_value = None
+                task_complete_peak = None
                 cached_policy_actions = []
                 open_loop_steps_remaining = 0
                 tray_base_yaw_deg = tray_yaw_deg
@@ -1054,6 +1071,8 @@ def main():
                                 action_dict, task_complete_value, last_policy_ms = _probe_task_progress(
                                     policy, env, keyboard.selected_task_idx
                                 )
+                            if task_complete_value is not None:
+                                task_complete_peak = max(task_complete_peak or 0.0, task_complete_value)
                             action_chunk = _convert_policy_action_chunk_to_env(action_dict)
                             if not action_chunk:
                                 raise RuntimeError("Policy returned an empty action chunk.")
@@ -1119,18 +1138,32 @@ def main():
                     tray_rotation_active = False
                     reason = "terminated" if bool(terminated[0]) else "truncated"
                     keyboard.last_message = f"Episode finished ({reason}). Press R to reset."
-                elif (
+                direct_complete = (
+                    task_complete_value is not None and task_complete_value >= args.task_complete_threshold
+                )
+                drop_complete = (
+                    task_complete_value is not None
+                    and task_complete_peak is not None
+                    and task_complete_peak >= args.task_complete_peak_threshold
+                    and task_complete_value <= args.task_complete_drop_threshold
+                )
+                if (
                     executing_policy_step
                     and keyboard.running
                     and keyboard.stop_on_task_complete
-                    and task_complete_value is not None
-                    and task_complete_value >= args.task_complete_threshold
+                    and (direct_complete or drop_complete)
                 ):
                     keyboard.running = False
-                    keyboard.last_message = (
-                        f"Paused: task_complete={task_complete_value:.4f} "
-                        f">= threshold {args.task_complete_threshold:.2f}."
-                    )
+                    if direct_complete:
+                        keyboard.last_message = (
+                            f"Paused: task_complete={task_complete_value:.4f} "
+                            f">= threshold {args.task_complete_threshold:.2f}."
+                        )
+                    else:
+                        keyboard.last_message = (
+                            f"Paused: task_complete dropped to {task_complete_value:.4f} after "
+                            f"peak={task_complete_peak:.4f}; treating current task as complete."
+                        )
                 elif keyboard.running and task_run_step_count >= args.task_timeout_steps:
                     keyboard.running = False
                     keyboard.last_message = (
@@ -1144,6 +1177,7 @@ def main():
             panel.update(
                 keyboard=keyboard,
                 task_complete_value=task_complete_value,
+                task_complete_peak=task_complete_peak,
                 step_count=step_count,
                 task_run_step_count=task_run_step_count,
                 episode_done=episode_done,

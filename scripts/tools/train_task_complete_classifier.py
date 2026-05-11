@@ -63,7 +63,7 @@ N, feat_dim = features.shape
 n_tasks = 5
 print(f"  Samples: {N}  feature_dim: {feat_dim}")
 print(f"  Progress: min={labels.min():.4f} mean={labels.mean():.4f} max={labels.max():.4f}")
-print(f"  Source-prompt samples: {(task_idx == source_task_idx).sum()}  Cross negatives: {(task_idx != source_task_idx).sum()}")
+print(f"  Source-prompt samples: {(task_idx == source_task_idx).sum()}  Cross-prompt samples: {(task_idx != source_task_idx).sum()}")
 for i in range(n_tasks):
     mask = task_idx == i
     label_mean = labels[mask].mean() if mask.any() else 0.0
@@ -113,7 +113,7 @@ X_train_full = torch.cat([X_train, oh_train], dim=-1)  # (N, D+5)
 X_val_full   = torch.cat([X_val,   oh_val],   dim=-1)
 
 def make_sample_weights(prompt_task: torch.Tensor, source_task: torch.Tensor) -> torch.Tensor:
-    """Balance source-prompt progress samples and cross-task negative samples."""
+    """Balance source-prompt progress samples and cross-prompt ordered samples."""
     is_cross = prompt_task != source_task
     n_total = len(prompt_task)
     n_cross = int(is_cross.sum().item())
@@ -198,7 +198,7 @@ def evaluate(loader):
 best_mae = float("inf")
 best_epoch = 0
 
-print(f"\n{'Epoch':>5} {'train_loss':>10} {'val_loss':>8} {'mae':>8} {'rmse':>8} {'src_mae':>8} {'xneg_mae':>9} {'bal_mae':>8}")
+print(f"\n{'Epoch':>5} {'train_loss':>10} {'val_loss':>8} {'mae':>8} {'rmse':>8} {'src_mae':>8} {'cross_mae':>9} {'bal_mae':>8}")
 print("-" * 78)
 
 for epoch in range(1, args.epochs + 1):
@@ -232,7 +232,7 @@ for epoch in range(1, args.epochs + 1):
             "best_balanced_mae": best_mae,
             "val_mae": mae,
             "val_source_mae": source_mae,
-            "val_cross_negative_mae": cross_mae,
+            "val_cross_prompt_mae": cross_mae,
             "epoch": epoch,
             "output_kind": "episode_progress",
         }, os.path.join(args.output_dir, "best_model.pt"))

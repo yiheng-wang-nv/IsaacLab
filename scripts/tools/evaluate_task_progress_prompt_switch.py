@@ -15,6 +15,7 @@ to task 2, predicted task-2 progress should drop back near 0.
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib.util
 import json
 import sys
@@ -162,6 +163,18 @@ def _print_matrix(title: str, results: dict[tuple[int, int], list[float]], n_tas
         print(f"prompt{prompt_idx + 1:<3d} " + " ".join(row))
 
 
+def _write_matrix_csv(path: Path, results: dict[tuple[int, int], list[float]], n_tasks: int) -> None:
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["prompt_task", *[f"img_task_{i + 1}" for i in range(n_tasks)]])
+        for prompt_idx in range(n_tasks):
+            writer.writerow(
+                [f"prompt{prompt_idx + 1}"]
+                + [f"{_mean_or_nan(results[(prompt_idx, image_idx)]):.4f}" for image_idx in range(n_tasks)]
+            )
+    print(f"[INFO] Wrote {path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True, help="Path to the Isaac-GR00T checkpoint directory.")
@@ -296,6 +309,7 @@ def main() -> None:
 
     for frame_kind in frame_kinds:
         _print_matrix(f"{frame_kind.upper()} frame predicted progress", results_by_frame[frame_kind], n_tasks)
+        _write_matrix_csv(Path(f"prompt_switch_{frame_kind}_frame.csv"), results_by_frame[frame_kind], n_tasks)
 
     if "last" in results_by_frame:
         print("\nStage-switch check on LAST frames")

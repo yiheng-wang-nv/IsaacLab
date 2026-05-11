@@ -62,16 +62,16 @@ parser.add_argument("--max_episodes", type=int, default=None, help="Cap episodes
 parser.add_argument(
     "--cross_task_negatives",
     action="store_true",
-    help="Also extract features with non-source task prompts and label them as 0 progress.",
+    help="Also extract features with non-source task prompts using ordered-stage labels.",
 )
 parser.add_argument(
     "--neighbor_exclusion_frac",
     type=float,
-    default=0.10,
+    default=0.0,
     help=(
         "For adjacent task prompt negatives, drop the closest boundary fraction: "
         "source task i -> prompt i+1 uses progress <= 1-frac; "
-        "source task i -> prompt i-1 uses progress >= frac."
+        "source task i -> prompt i-1 uses progress >= frac. Keep 0.0 for full ordered-stage data."
     ),
 )
 args = parser.parse_args()
@@ -244,14 +244,15 @@ for episode_idx, parquet_path in enumerate(tqdm(parquet_files, desc="Episodes"))
                 if prompt_task_idx == task_idx:
                     continue
 
-                include_negative = True
+                include_prompt = True
                 if prompt_task_idx == task_idx + 1:
-                    include_negative = progress <= 1.0 - args.neighbor_exclusion_frac
+                    include_prompt = progress <= 1.0 - args.neighbor_exclusion_frac
                 elif prompt_task_idx == task_idx - 1:
-                    include_negative = progress >= args.neighbor_exclusion_frac
+                    include_prompt = progress >= args.neighbor_exclusion_frac
 
-                if include_negative:
-                    prompt_label_pairs.append((prompt_task_idx, 0.0))
+                if include_prompt:
+                    label = 0.0 if task_idx < prompt_task_idx else 1.0
+                    prompt_label_pairs.append((prompt_task_idx, label))
 
         for prompt_task_idx, label in prompt_label_pairs:
             prompt_desc = task_idx_to_desc.get(prompt_task_idx, TASK_DESCRIPTIONS[prompt_task_idx])
@@ -284,18 +285,19 @@ np.save(os.path.join(args.output_dir, "task_index.npy"), task_np)
 np.save(os.path.join(args.output_dir, "source_task_index.npy"), source_task_np)
 np.save(os.path.join(args.output_dir, "episode_index.npy"), episode_np)
 
-positive_mask = task_np == source_task_np
-cross_negative_mask = task_np != source_task_np
+source_prompt_mask = task_np == source_task_np
+cross_prompt_mask = task_np != source_task_np
 
 meta = {
     "n_samples": int(len(labels_np)),
     "n_episodes": int(len(np.unique(episode_np))),
     "feature_dim": int(features_np.shape[1]),
-    "label_type": "linear_episode_progress",
+    "label_type": "ordered_stage_progress" if args.cross_task_negatives else "linear_episode_progress",
+    "ordered_stage_rule": "source<prompt -> 0, source==prompt -> episode progress, source>prompt -> 1",
     "cross_task_negatives": bool(args.cross_task_negatives),
     "neighbor_exclusion_frac": float(args.neighbor_exclusion_frac),
-    "n_source_prompt_samples": int(positive_mask.sum()),
-    "n_cross_negative_samples": int(cross_negative_mask.sum()),
+    "n_source_prompt_samples": int(source_prompt_mask.sum()),
+    "n_cross_prompt_samples": int(cross_prompt_mask.sum()),
     "label_min": float(labels_np.min()),
     "label_max": float(labels_np.max()),
     "label_mean": float(labels_np.mean()),
@@ -306,7 +308,7 @@ meta = {
             "n": int((task_np == i).sum()),
             "n_episodes": int(len(np.unique(episode_np[task_np == i]))),
             "label_mean": float(labels_np[task_np == i].mean()) if (task_np == i).any() else 0.0,
-            "n_cross_negative": int(((task_np == i) & cross_negative_mask).sum()),
+            "n_cross_prompt": int(((task_np == i) & cross_prompt_mask).sum()),
         }
         for i in range(5)
     },
@@ -316,12 +318,12 @@ with open(os.path.join(args.output_dir, "meta.json"), "w") as f:
 
 print(f"\n[DONE] Saved {len(labels_np)} samples to {args.output_dir}")
 print(f"  Episodes: {len(np.unique(episode_np))}")
-print(f"  Source-prompt samples: {positive_mask.sum()}  Cross-task negatives: {cross_negative_mask.sum()}")
+print(f"  Source-prompt samples: {source_prompt_mask.sum()}  Cross-prompt samples: {cross_prompt_mask.sum()}")
 print(f"  Progress label: min={labels_np.min():.4f} mean={labels_np.mean():.4f} max={labels_np.max():.4f}")
 print(f"  Feature dim: {features_np.shape[1]}")
 for i, desc in enumerate(TASK_DESCRIPTIONS):
     n = (task_np == i).sum()
     ep = len(np.unique(episode_np[task_np == i]))
     label_mean = labels_np[task_np == i].mean() if n else 0.0
-    n_neg = ((task_np == i) & cross_negative_mask).sum()
-    print(f"  Task {i+1} ({desc}): {n} samples, {ep} episodes, negatives={n_neg}, mean_progress={label_mean:.4f}")
+    n_cross = ((task_np == i) & cross_prompt_mask).sum()
+    print(f"  Task {i+1} ({desc}): {n} samples, {ep} episodes, cross_prompts={n_cross}, mean_progress={label_mean:.4f}")
