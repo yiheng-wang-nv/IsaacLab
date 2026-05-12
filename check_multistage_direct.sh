@@ -1,5 +1,13 @@
-DISPLAY=:1 XAUTHORITY=$HOME/.Xauthority \
-  ./isaaclab.sh -p scripts/tools/interactive_trocar_task_complete.py \
+./isaaclab.sh -p scripts/tools/interactive_trocar_task_complete.py \
+    --auto_multistage_direct \
+    --auto_record_video \
+    --auto_video_dir /home/nvidia/workspace/yiheng/IsaacLab/multistage_direct_videos_100e \
+    --auto_video_fps 30 \
+    --auto_num_episodes 100 \
+    --auto_task_indices 0,1,2,3,4 \
+    --auto_task_thresholds 0.98,0.98,0.999,0.98,0.98 \
+    --auto_total_steps_per_task 300 \
+    --auto_no_retry_last_task \
     --model_path /home/nvidia/workspace/yiheng/models/sim6_gr00t_n15_100ksteps_split_stage \
     --gr00t_root /home/nvidia/workspace/yiheng/IsaacLab/Isaac-GR00T \
     --progress_regressor_path /home/nvidia/workspace/yiheng/models/task_progress_regressor_ordered/best_model.pt \
@@ -18,6 +26,6 @@ DISPLAY=:1 XAUTHORITY=$HOME/.Xauthority \
     --task34_recover_right_arm_delta 0.0,0.0,-0.35,0.0,0.0,0.0,0.0 \
     --tray_yaw_increment_deg -10 \
     --fixed_initial_state_tolerance 0.035 --seed 42 --task_complete_threshold 0.98 \
-    --task3_complete_threshold 0.995 \
+    --task3_complete_threshold 0.999 \
     --task_broken_drop_threshold 0.30 \
     --stage_precondition_threshold 0.95

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -80,6 +81,57 @@ parser.add_argument(
     type=float,
     default=None,
     help="Optional task_complete auto-pause threshold override for task 3.",
+)
+parser.add_argument(
+    "--auto_multistage_direct",
+    action="store_true",
+    help="Run tasks automatically without keyboard/GUI control, advancing only when progress reaches threshold.",
+)
+parser.add_argument(
+    "--auto_task_indices",
+    type=str,
+    default="0,1,2,3,4",
+    help="Comma-separated zero-based task indices for direct multi-stage inference.",
+)
+parser.add_argument(
+    "--auto_task_thresholds",
+    type=str,
+    default="0.98,0.98,0.999,0.98,0.98",
+    help="Comma-separated thresholds matching --auto_task_indices, or one value per known task.",
+)
+parser.add_argument(
+    "--auto_num_episodes",
+    type=int,
+    default=1,
+    help="Number of environment episodes to run in direct multi-stage inference.",
+)
+parser.add_argument(
+    "--auto_total_steps_per_task",
+    type=int,
+    default=300,
+    help="Maximum policy env steps allowed per task in direct multi-stage inference.",
+)
+parser.add_argument(
+    "--auto_no_retry_last_task",
+    action="store_true",
+    help="In direct multi-stage inference, run the final configured task for only one attempt.",
+)
+parser.add_argument(
+    "--auto_record_video",
+    action="store_true",
+    help="Record the three camera views during direct multi-stage inference.",
+)
+parser.add_argument(
+    "--auto_video_dir",
+    type=str,
+    default="multistage_direct_videos",
+    help="Output directory for direct multi-stage camera videos.",
+)
+parser.add_argument(
+    "--auto_video_fps",
+    type=float,
+    default=30.0,
+    help="FPS used when writing direct multi-stage videos.",
 )
 parser.add_argument(
     "--task_broken_drop_threshold",
@@ -254,7 +306,7 @@ parser.add_argument(
 )
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
-args.headless = False
+args.headless = bool(args.auto_multistage_direct)
 args.enable_cameras = True
 
 
@@ -285,7 +337,7 @@ if not os.environ.get("XAUTHORITY"):
     if default_xauthority.exists():
         os.environ["XAUTHORITY"] = str(default_xauthority)
 
-if getattr(args, "visualizer", None) in (None, []):
+if not args.auto_multistage_direct and getattr(args, "visualizer", None) in (None, []):
     args.visualizer = ["kit"]
     args.visualizer_explicit = True
 
@@ -371,6 +423,38 @@ def _task_complete_threshold(task_idx: int) -> float:
     return args.task_complete_threshold
 
 
+def _parse_index_list(value: str, name: str) -> list[int]:
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    if not parts:
+        raise ValueError(f"{name} must contain at least one index.")
+    indices = [int(p) for p in parts]
+    invalid = [idx for idx in indices if idx < 0 or idx >= len(TASK_DESCRIPTIONS)]
+    if invalid:
+        raise ValueError(f"{name} contains invalid task indices {invalid}; valid range is 0-{len(TASK_DESCRIPTIONS) - 1}.")
+    return indices
+
+
+def _parse_float_list(value: str, name: str) -> list[float]:
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    if not parts:
+        raise ValueError(f"{name} must contain at least one float.")
+    return [float(p) for p in parts]
+
+
+def _direct_task_thresholds(task_indices: list[int]) -> dict[int, float]:
+    values = _parse_float_list(args.auto_task_thresholds, "--auto_task_thresholds")
+    if len(values) == 1:
+        return {idx: values[0] for idx in task_indices}
+    if len(values) == len(task_indices):
+        return {idx: value for idx, value in zip(task_indices, values, strict=True)}
+    if len(values) == len(TASK_DESCRIPTIONS):
+        return {idx: values[idx] for idx in task_indices}
+    raise ValueError(
+        "--auto_task_thresholds must contain 1 value, one value per --auto_task_indices, "
+        f"or {len(TASK_DESCRIPTIONS)} values for all tasks; got {len(values)}."
+    )
+
+
 def _print_controls() -> None:
     print("Interactive trocar task-complete controls:")
     print("  1-5   : select stage task prompt")
@@ -436,14 +520,20 @@ def _create_env(task_id: str, device: str):
         cam_cfg = getattr(env_cfg.scene, cam_name)
         cam_cfg.data_types = ["rgb"]
     disabled_terms = []
-    for term_name in ("time_out", "task_success", "object_drop"):
+    terminations_to_disable = ("time_out", "object_drop") if args.auto_multistage_direct else (
+        "time_out",
+        "task_success",
+        "object_drop",
+    )
+    for term_name in terminations_to_disable:
         if hasattr(env_cfg.terminations, term_name):
             setattr(env_cfg.terminations, term_name, None)
             disabled_terms.append(term_name)
     if disabled_terms:
+        mode_text = "direct success is env-native" if args.auto_multistage_direct else "interactive stopping is prediction-driven"
         print(
             "[INFO] Disabled env terminations "
-            f"({', '.join(disabled_terms)}); interactive stopping is prediction-driven."
+            f"({', '.join(disabled_terms)}); {mode_text}."
         )
     env_cfg.recorders = {}
     return gym.make(task_id, cfg=env_cfg).unwrapped
@@ -681,17 +771,32 @@ def _recover_state_ref_to_action(state_ref: np.ndarray) -> np.ndarray:
     return action
 
 
-def _drive_state_ref_target(env, target_state_ref: np.ndarray, step_limit: int, tolerance: float) -> dict:
-    raw_action = _recover_state_ref_to_action(target_state_ref)
-    action = torch.tensor(raw_action.reshape(1, ROBOT_ACTION_DIM), dtype=torch.float32, device=env.device)
+def _drive_state_ref_target(
+    env,
+    target_state_ref: np.ndarray,
+    step_limit: int,
+    tolerance: float,
+    on_step=None,
+) -> dict:
     steps_run = 0
     last_env_step_ms = None
+    start_state_ref = _get_current_state_ref(env).copy()
+    target_state_ref = np.asarray(target_state_ref, dtype=np.float32)
     max_error = float(np.abs(_get_current_state_ref(env) - target_state_ref).max())
-    for step_idx in range(max(step_limit, 1)):
+    if max_error <= tolerance:
+        return {"steps": steps_run, "max_error": max_error, "last_env_step_ms": last_env_step_ms}
+    step_count = max(step_limit, 1)
+    for step_idx in range(step_count):
+        alpha = float(step_idx + 1) / float(step_count)
+        step_target_state_ref = start_state_ref + alpha * (target_state_ref - start_state_ref)
+        raw_action = _recover_state_ref_to_action(step_target_state_ref)
+        action = torch.tensor(raw_action.reshape(1, ROBOT_ACTION_DIM), dtype=torch.float32, device=env.device)
         t0 = time.perf_counter()
         env.step(action)
         last_env_step_ms = (time.perf_counter() - t0) * 1000.0
         steps_run = step_idx + 1
+        if on_step is not None:
+            on_step()
         max_error = float(np.abs(_get_current_state_ref(env) - target_state_ref).max())
         if max_error <= tolerance:
             break
@@ -734,6 +839,46 @@ def _get_camera_rgb(env, cam_name: str) -> np.ndarray:
     if imgs.shape[-1] == 4:
         imgs = imgs[..., :3]
     return imgs.astype(np.uint8)
+
+
+class MultiViewVideoRecorder:
+    def __init__(self, output_dir: str | Path, fps: float):
+        import cv2
+
+        self._cv2 = cv2
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.fps = float(fps)
+        self._writers = {}
+        self.frame_count = 0
+
+    def capture(self, env) -> None:
+        for cam_name in CAMERA_KEYS:
+            frame = _get_camera_rgb(env, cam_name)[0]
+            writer = self._writers.get(cam_name)
+            if writer is None:
+                height, width = frame.shape[:2]
+                path = self.output_dir / f"{cam_name}.mp4"
+                writer = self._cv2.VideoWriter(
+                    str(path),
+                    self._cv2.VideoWriter_fourcc(*"mp4v"),
+                    self.fps,
+                    (width, height),
+                )
+                if not writer.isOpened():
+                    raise RuntimeError(f"Failed to open video writer: {path}")
+                self._writers[cam_name] = writer
+            writer.write(self._cv2.cvtColor(frame, self._cv2.COLOR_RGB2BGR))
+        self.frame_count += 1
+
+    def close(self) -> None:
+        for writer in self._writers.values():
+            writer.release()
+        self._writers.clear()
+
+    @property
+    def paths(self) -> list[Path]:
+        return [self.output_dir / f"{cam_name}.mp4" for cam_name in CAMERA_KEYS]
 
 
 def _sample_initial_tray_yaw_deg(rng: np.random.Generator) -> float:
@@ -1180,6 +1325,327 @@ class StatusPanel:
         )
 
 
+def _auto_recover_task34_reference(
+    env,
+    task_idx: int,
+    task34_recover_state_ref: np.ndarray,
+    video_recorder: MultiViewVideoRecorder | None = None,
+) -> dict:
+    current_state_ref = _get_current_state_ref(env)
+    spread_steps_run = 0
+    spread_error = None
+    if args.task34_recover_spread_steps > 0:
+        spread_state_ref = _make_task34_recover_spread_state_ref(current_state_ref)
+        spread_info = _drive_state_ref_target(
+            env,
+            spread_state_ref,
+            args.task34_recover_spread_steps,
+            args.fixed_initial_state_tolerance,
+            on_step=None if video_recorder is None else lambda: video_recorder.capture(env),
+        )
+        spread_steps_run = int(spread_info["steps"])
+        spread_error = float(spread_info["max_error"])
+
+    recover_info = _drive_state_ref_target(
+        env,
+        task34_recover_state_ref.copy(),
+        max(args.recover_steps, 1),
+        args.fixed_initial_state_tolerance,
+        on_step=None if video_recorder is None else lambda: video_recorder.capture(env),
+    )
+    recover_error = float(recover_info["max_error"])
+    top_errors = _format_top_state_errors(_get_current_state_ref(env), task34_recover_state_ref)
+    _flush_observations(env)
+    print(
+        f"[AUTO] Recovered task {task_idx + 1} to reference episode "
+        f"{args.task34_recover_reference_episode} frame {args.task34_recover_reference_frame}: "
+        f"spread={spread_steps_run}/{args.task34_recover_spread_steps}"
+        + ("" if spread_error is None else f" spread_error={spread_error:.4f}")
+        + f", recover={int(recover_info['steps'])}/{max(args.recover_steps, 1)} "
+        f"max_error={recover_error:.4f}."
+    )
+    print(f"[AUTO] Recover top joint errors: {top_errors}")
+    return {
+        "spread_steps": spread_steps_run,
+        "recover_steps": int(recover_info["steps"]),
+        "recover_error": recover_error,
+    }
+
+
+def _run_direct_multistage(
+    policy,
+    env,
+    task34_recover_state_ref: np.ndarray | None,
+    video_recorder: MultiViewVideoRecorder | None = None,
+) -> dict:
+    task_indices = _parse_index_list(args.auto_task_indices, "--auto_task_indices")
+    thresholds = _direct_task_thresholds(task_indices)
+    attempt_step_limit = max(args.task_timeout_steps, 1)
+    total_step_limit = max(args.auto_total_steps_per_task, attempt_step_limit)
+    max_attempts = max(1, (total_step_limit + attempt_step_limit - 1) // attempt_step_limit)
+    total_env_steps = 0
+    result = {
+        "success": False,
+        "success_source": None,
+        "tasks": [],
+        "total_policy_steps": 0,
+        "recover_count": 0,
+        "failed_task_idx": None,
+    }
+
+    print(
+        "[AUTO] Direct multi-stage inference starting: "
+        f"tasks={[idx + 1 for idx in task_indices]}, "
+        f"thresholds={[thresholds[idx] for idx in task_indices]}, "
+        f"attempt_steps={attempt_step_limit}, total_steps_per_task={total_step_limit}, "
+        f"max_attempts={max_attempts}."
+    )
+    if video_recorder is not None:
+        video_recorder.capture(env)
+
+    for task_order_idx, task_idx in enumerate(task_indices):
+        threshold = thresholds[task_idx]
+        is_final_task = task_order_idx == len(task_indices) - 1
+        task_max_attempts = 1 if args.auto_no_retry_last_task and task_order_idx == len(task_indices) - 1 else max_attempts
+        task_total_step_limit = attempt_step_limit if task_max_attempts == 1 else total_step_limit
+        task_policy_steps = 0
+        task_success = False
+        task_result = {
+            "task_idx": task_idx,
+            "task_number": task_idx + 1,
+            "threshold": threshold,
+            "success": False,
+            "attempts": 0,
+            "policy_steps": 0,
+            "recover_count": 0,
+            "final_progress": None,
+        }
+        print(
+            f"[AUTO] Task {task_idx + 1} start: {TASK_DESCRIPTIONS[task_idx]}, "
+            f"threshold={threshold:.4f}, max_attempts={task_max_attempts}"
+            + (" (final success uses env-native task_success)." if is_final_task else ".")
+        )
+
+        for attempt_idx in range(1, task_max_attempts + 1):
+            if task_policy_steps >= task_total_step_limit:
+                break
+            task_result["attempts"] = attempt_idx
+            cached_policy_actions: list[np.ndarray] = []
+            attempt_steps = 0
+            last_progress: float | None = None
+            print(
+                f"[AUTO] Task {task_idx + 1} attempt {attempt_idx}/{task_max_attempts} "
+                f"starting at task_steps={task_policy_steps}/{task_total_step_limit}."
+            )
+
+            while simulation_app.is_running() and attempt_steps < attempt_step_limit:
+                if task_policy_steps >= task_total_step_limit:
+                    break
+                if not cached_policy_actions:
+                    with torch.inference_mode():
+                        action_dict, last_progress, policy_ms = _probe_task_progress(policy, env, task_idx)
+                    if not is_final_task and last_progress is not None and last_progress >= threshold:
+                        task_success = True
+                        print(
+                            f"[AUTO] Task {task_idx + 1} reached threshold before step: "
+                            f"progress={last_progress:.4f} >= {threshold:.4f}."
+                        )
+                        task_result["final_progress"] = last_progress
+                        break
+                    action_chunk = _convert_policy_action_chunk_to_env(action_dict)
+                    if not action_chunk:
+                        raise RuntimeError("Policy returned an empty action chunk.")
+                    cached_policy_actions = [a.copy() for a in action_chunk[: max(args.open_loop_steps, 1)]]
+                    print(
+                        f"[AUTO] Task {task_idx + 1} attempt {attempt_idx}: "
+                        f"progress={last_progress} policy_ms={policy_ms:.0f} "
+                        f"steps={attempt_steps}/{attempt_step_limit}."
+                    )
+
+                action_np = cached_policy_actions.pop(0)
+                action_tensor = _raw_action_to_env_tensor(action_np, device=env.device)
+                t0 = time.perf_counter()
+                _, _, terminated, truncated, _ = env.step(action_tensor)
+                env_step_ms = (time.perf_counter() - t0) * 1000.0
+                total_env_steps += 1
+                task_policy_steps += 1
+                attempt_steps += 1
+                if video_recorder is not None:
+                    video_recorder.capture(env)
+
+                if bool(terminated[0]) or bool(truncated[0]):
+                    reason = "terminated" if bool(terminated[0]) else "truncated"
+                    print(
+                        f"[AUTO] Episode finished by env-native {reason} during task {task_idx + 1} "
+                        f"attempt {attempt_idx} ({reason}) after env_step_ms={env_step_ms:.0f}."
+                    )
+                    task_success = True
+                    task_result["success"] = True
+                    task_result["policy_steps"] = task_policy_steps
+                    task_result["final_progress"] = last_progress
+                    result["tasks"].append(task_result)
+                    result["success"] = bool(terminated[0])
+                    result["success_source"] = "env_task_success" if bool(terminated[0]) else "env_truncated"
+                    result["failed_task_idx"] = None if bool(terminated[0]) else task_idx
+                    result["total_policy_steps"] = total_env_steps
+                    return result
+
+            if task_success:
+                break
+
+            with torch.inference_mode():
+                _, last_progress, policy_ms = _probe_task_progress(policy, env, task_idx)
+            if not is_final_task and last_progress is not None and last_progress >= threshold:
+                task_success = True
+                print(
+                    f"[AUTO] Task {task_idx + 1} reached threshold after attempt {attempt_idx}: "
+                    f"progress={last_progress:.4f} >= {threshold:.4f}."
+                )
+                task_result["final_progress"] = last_progress
+                break
+            task_result["final_progress"] = last_progress
+
+            print(
+                f"[AUTO] Task {task_idx + 1} attempt {attempt_idx} ended at "
+                f"progress={last_progress} after {attempt_steps}/{attempt_step_limit} steps "
+                f"(task_steps={task_policy_steps}/{task_total_step_limit})."
+            )
+
+            if (
+                task_idx == 2
+                and task_policy_steps < task_total_step_limit
+                and attempt_idx < task_max_attempts
+                and task34_recover_state_ref is not None
+            ):
+                print("[AUTO] Task 3 timed out below threshold; running recover before the next attempt.")
+                _auto_recover_task34_reference(env, task_idx, task34_recover_state_ref, video_recorder)
+                task_result["recover_count"] += 1
+                result["recover_count"] += 1
+            elif task_idx == 2 and task34_recover_state_ref is None:
+                print("[AUTO] Task 3 recover target is unavailable; retrying without recover.")
+
+        task_result["success"] = task_success
+        task_result["policy_steps"] = task_policy_steps
+        if task_success and task_result["final_progress"] is None:
+            with torch.inference_mode():
+                _, final_progress, _ = _probe_task_progress(policy, env, task_idx)
+            task_result["final_progress"] = final_progress
+        result["tasks"].append(task_result)
+
+        if not task_success:
+            print(
+                f"[AUTO] Task {task_idx + 1} failed to reach threshold {threshold:.4f} "
+                f"within {task_policy_steps}/{task_total_step_limit} policy steps."
+            )
+            result["failed_task_idx"] = task_idx
+            result["total_policy_steps"] = total_env_steps
+            return result
+
+        print(
+            f"[AUTO] Task {task_idx + 1} complete after {task_policy_steps} policy steps. "
+            "Advancing to next task."
+        )
+
+    print(f"[AUTO] Direct multi-stage inference finished successfully after {total_env_steps} policy env steps.")
+    result["success"] = True
+    result["total_policy_steps"] = total_env_steps
+    return result
+
+
+def _run_direct_multistage_episodes(
+    policy,
+    env,
+    rng: np.random.Generator,
+    fixed_initial_raw_action: np.ndarray | None,
+    fixed_initial_state_ref: np.ndarray | None,
+    task34_recover_state_ref: np.ndarray | None,
+) -> bool:
+    episode_count = max(args.auto_num_episodes, 1)
+    all_success = True
+    episode_results = []
+    for episode_idx in range(episode_count):
+        tray_yaw_deg = _sample_initial_tray_yaw_deg(rng)
+        print(
+            f"[AUTO] ===== Episode {episode_idx + 1}/{episode_count} start "
+            f"(tray_yaw={tray_yaw_deg:.2f} deg) ====="
+        )
+        _reset_env(
+            env,
+            seed=None if args.seed is None else args.seed + episode_idx,
+            tray_yaw_deg=tray_yaw_deg,
+            fixed_raw_action=fixed_initial_raw_action,
+            fixed_state_ref=fixed_initial_state_ref,
+        )
+
+        video_recorder = None
+        if args.auto_record_video:
+            video_dir = Path(args.auto_video_dir) / f"episode_{episode_idx:06d}"
+            video_recorder = MultiViewVideoRecorder(video_dir, args.auto_video_fps)
+
+        try:
+            episode_result = _run_direct_multistage(policy, env, task34_recover_state_ref, video_recorder)
+            episode_result["episode_idx"] = episode_idx
+            episode_result["tray_yaw_deg"] = tray_yaw_deg
+            episode_results.append(episode_result)
+            success = bool(episode_result["success"])
+            all_success = all_success and success
+            print(
+                f"[AUTO] ===== Episode {episode_idx + 1}/{episode_count} "
+                f"{'succeeded' if success else 'failed'} ====="
+            )
+        finally:
+            if video_recorder is not None:
+                video_recorder.close()
+                print(
+                    f"[AUTO] Saved episode {episode_idx + 1} video "
+                    f"({video_recorder.frame_count} frames): "
+                    f"{', '.join(str(path) for path in video_recorder.paths)}"
+                )
+
+    _write_direct_multistage_results(episode_results)
+    success_count = sum(1 for item in episode_results if item["success"])
+    success_rate = success_count / max(len(episode_results), 1)
+    task_indices = _parse_index_list(args.auto_task_indices, "--auto_task_indices")
+    print(
+        f"[AUTO] Success rate: {success_count}/{len(episode_results)} episodes "
+        f"({success_rate * 100.0:.1f}%)."
+    )
+    for task_idx in task_indices:
+        task_results = [
+            task
+            for episode in episode_results
+            for task in episode["tasks"]
+            if task["task_idx"] == task_idx
+        ]
+        task_success_count = sum(1 for task in task_results if task["success"])
+        task_rate = task_success_count / max(len(task_results), 1)
+        print(
+            f"[AUTO] Task {task_idx + 1} success rate: "
+            f"{task_success_count}/{len(task_results)} ({task_rate * 100.0:.1f}%)."
+        )
+    print(
+        f"[AUTO] Completed {episode_count} direct episode(s); "
+        f"all_success={all_success}."
+    )
+    return all_success
+
+
+def _write_direct_multistage_results(episode_results: list[dict]) -> None:
+    video_dir = Path(args.auto_video_dir)
+    video_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = video_dir / "summary.json"
+    success_count = sum(1 for item in episode_results if item["success"])
+    summary = {
+        "num_episodes": len(episode_results),
+        "success_count": success_count,
+        "success_rate": success_count / max(len(episode_results), 1),
+        "total_recover_count": sum(int(item.get("recover_count", 0)) for item in episode_results),
+        "episodes": episode_results,
+    }
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"[AUTO] Wrote direct multi-stage summary: {summary_path}")
+
+
 def main():
     model_device = args.model_device or args.device
     policy = _load_policy(
@@ -1218,18 +1684,35 @@ def main():
             f"episode={args.task34_recover_reference_episode}, frame={args.task34_recover_reference_frame}"
         )
 
-    keyboard = KeyboardInterface(
-        stop_on_task_complete=args.enable_task_complete_stop,
-        initial_task_idx=args.initial_task,
-    )
-    panel = StatusPanel(keyboard)
-    _print_controls()
+    if args.auto_multistage_direct:
+        try:
+            success = _run_direct_multistage_episodes(
+                policy,
+                env,
+                rng,
+                fixed_initial_raw_action,
+                fixed_initial_state_ref,
+                task34_recover_state_ref,
+            )
+            if not success:
+                raise RuntimeError("At least one direct multi-stage episode did not reach all requested thresholds.")
+        finally:
+            env.close()
+            simulation_app.close()
+        return
 
     tray_yaw_deg = _sample_initial_tray_yaw_deg(rng)
     _reset_env(
         env, seed=args.seed, tray_yaw_deg=tray_yaw_deg,
         fixed_raw_action=fixed_initial_raw_action, fixed_state_ref=fixed_initial_state_ref,
     )
+
+    keyboard = KeyboardInterface(
+        stop_on_task_complete=args.enable_task_complete_stop,
+        initial_task_idx=args.initial_task,
+    )
+    panel = StatusPanel(keyboard)
+    _print_controls()
 
     step_count = 0
     task_run_step_count = 0
@@ -1246,6 +1729,7 @@ def main():
     previous_task_selection_serial = keyboard.task_selection_serial
     previous_running = keyboard.running
     recovered_task_indices: set[int] = set()
+    stage_precondition_checked_for_task_idx: int | None = None
     last_policy_ms: float | None = None
     last_env_step_ms: float | None = None
     step_period = 1.0 / max(args.step_hz, 1e-6)
@@ -1278,6 +1762,7 @@ def main():
                 task_run_step_count = 0
                 cached_policy_actions = []
                 open_loop_steps_remaining = 0
+                stage_precondition_checked_for_task_idx = None
 
             # Starting a new attempt should not inherit broken/stuck statistics from a previous run.
             if keyboard.running and not previous_running:
@@ -1289,6 +1774,7 @@ def main():
                 task_run_step_count = 0
                 cached_policy_actions = []
                 open_loop_steps_remaining = 0
+                stage_precondition_checked_for_task_idx = None
                 print(f"[INFO] Starting task {keyboard.selected_task_idx + 1}: cleared progress monitor history.")
             previous_running = keyboard.running
 
@@ -1312,6 +1798,7 @@ def main():
                 task_state_histories = [[] for _ in TASK_DESCRIPTIONS]
                 cached_policy_actions = []
                 open_loop_steps_remaining = 0
+                stage_precondition_checked_for_task_idx = None
                 tray_base_yaw_deg = tray_yaw_deg
                 tray_rotation_active = False
                 tray_rotation_start_yaw = tray_yaw_deg
@@ -1357,7 +1844,7 @@ def main():
                             spread_error = float(spread_info["max_error"])
                             last_env_step_ms = spread_info["last_env_step_ms"]
                             step_count += spread_steps_run
-                        recover_state_ref = task34_recover_state_ref
+                        recover_state_ref = task34_recover_state_ref.copy()
                         recover_mode_text = (
                             f" to reference episode {args.task34_recover_reference_episode} "
                             f"frame {args.task34_recover_reference_frame}"
@@ -1386,6 +1873,7 @@ def main():
                     task_stuck_detection_enabled = False
                     task_progress_history = []
                     task_run_step_count = 0
+                    stage_precondition_checked_for_task_idx = None
                     next_task_idx = 2 if target_task_idx == 3 and use_task34_reference else target_task_idx
                     keyboard.selected_task_idx = next_task_idx
                     previous_task_idx = next_task_idx
@@ -1483,6 +1971,7 @@ def main():
                             args.enable_stage_precondition
                             and selected_task_idx > 0
                             and selected_task_idx not in recovered_task_indices
+                            and stage_precondition_checked_for_task_idx != selected_task_idx
                         ):
                             required_prev_task_idx = selected_task_idx - 1
                             with torch.inference_mode():
@@ -1503,6 +1992,8 @@ def main():
                                     f"task {selected_task_idx + 1}."
                                 )
                                 print(f"[WARN] {keyboard.last_message}")
+                            else:
+                                stage_precondition_checked_for_task_idx = selected_task_idx
                         if should_step:
                             task_desc = TASK_DESCRIPTIONS[keyboard.selected_task_idx]
                             if task_start_state_ref is None:
