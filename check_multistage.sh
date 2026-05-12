@@ -4,12 +4,20 @@ DISPLAY=:1 XAUTHORITY=$HOME/.Xauthority \
     --gr00t_root /home/nvidia/workspace/yiheng/IsaacLab/Isaac-GR00T \
     --progress_regressor_path /home/nvidia/workspace/yiheng/models/task_progress_regressor_ordered/best_model.pt \
     --device cuda:0 \
-    --open_loop_steps 8 \
+    --open_loop_steps 4 \
+    --task_timeout_steps 60 \
     --fixed_initial_state_dataset /home/nvidia/workspace/yiheng/datasets/trocar_success_lt_7s_split_by_stage_task_complete \
     --fixed_initial_state_episode 0 \
     --fixed_initial_state_frame 0 \
     --fixed_initial_state_steps 10 \
-    --fixed_initial_state_tolerance 0.035 --seed 42 --task_complete_threshold 0.9 \
-    --stage_precondition_threshold 0.90 \
-    --task_complete_peak_threshold 0.90 \
-    --task_complete_drop_threshold 0.20
+    --recover_steps 60 \
+    --task34_recover_reference_episode 2 \
+    --task34_recover_reference_frame 10 \
+    --task34_recover_spread_steps 30 \
+    --task34_recover_left_arm_delta 0.0,0.0,0.35,0.0,0.0,0.0,0.0 \
+    --task34_recover_right_arm_delta 0.0,0.0,-0.35,0.0,0.0,0.0,0.0 \
+    --tray_yaw_increment_deg -10 \
+    --fixed_initial_state_tolerance 0.035 --seed 42 --task_complete_threshold 0.98 \
+    --task3_complete_threshold 0.995 \
+    --task_broken_drop_threshold 0.30 \
+    --stage_precondition_threshold 0.95

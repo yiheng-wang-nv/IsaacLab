@@ -243,7 +243,7 @@ class TerminationsCfg:
         time_out=False,  # This is a success termination, not a failure
         params={
             "print_log": False,
-            "success_stage": 3,
+            "success_stage": 4,
         },
     )
     object_drop = DoneTerm(

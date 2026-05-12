@@ -66,7 +66,7 @@ parser.add_argument(
 parser.add_argument(
     "--task_timeout_steps",
     type=int,
-    default=300,
+    default=60,
     help="Pause continuous inference when this many steps have elapsed.",
 )
 parser.add_argument(
@@ -76,16 +76,40 @@ parser.add_argument(
     help="Predicted task_complete value above which auto-pause triggers.",
 )
 parser.add_argument(
-    "--task_complete_peak_threshold",
+    "--task3_complete_threshold",
     type=float,
-    default=0.90,
-    help="If current task progress once exceeds this value and then drops, treat the task as complete.",
+    default=None,
+    help="Optional task_complete auto-pause threshold override for task 3.",
 )
 parser.add_argument(
-    "--task_complete_drop_threshold",
+    "--task_broken_drop_threshold",
     type=float,
-    default=0.20,
-    help="Drop threshold used with --task_complete_peak_threshold for hysteresis completion.",
+    default=0.30,
+    help="Pause and suggest recover if current task progress drops this much from the previous prediction.",
+)
+parser.add_argument(
+    "--task_broken_enable_threshold",
+    type=float,
+    default=0.80,
+    help="Only enable broken-task drop detection after current task progress has exceeded this value.",
+)
+parser.add_argument(
+    "--task_stuck_window",
+    type=int,
+    default=0,
+    help="Pause and suggest recover if progress does not improve enough over this many predictions. Disabled when <= 1.",
+)
+parser.add_argument(
+    "--task_stuck_min_progress_delta",
+    type=float,
+    default=0.0,
+    help="Minimum required progress increase over --task_stuck_window predictions. Disabled when <= 0.",
+)
+parser.add_argument(
+    "--task_stuck_enable_threshold",
+    type=float,
+    default=0.50,
+    help="Only enable stuck-task detection after current task progress has exceeded this value.",
 )
 parser.add_argument(
     "--stage_precondition_threshold",
@@ -175,6 +199,48 @@ parser.add_argument(
     help="Stop fixed-start warm-up early when max 28-DoF state error is below this value.",
 )
 parser.add_argument(
+    "--recover_steps",
+    type=int,
+    default=200,
+    help="Maximum env steps used to drive the robot back toward the current task-start pose on recover.",
+)
+parser.add_argument(
+    "--task34_recover_reference_dataset",
+    type=str,
+    default=None,
+    help="Dataset directory for the fixed task 3/4 recover target. Defaults to --fixed_initial_state_dataset.",
+)
+parser.add_argument(
+    "--task34_recover_reference_episode",
+    type=int,
+    default=2,
+    help="Episode index used as the fixed task 3/4 recover target.",
+)
+parser.add_argument(
+    "--task34_recover_reference_frame",
+    type=int,
+    default=10,
+    help="Frame index used as the fixed task 3/4 recover target.",
+)
+parser.add_argument(
+    "--task34_recover_spread_steps",
+    type=int,
+    default=30,
+    help="For task 3/4 recover, first drive arms outward for this many env steps before normal recover.",
+)
+parser.add_argument(
+    "--task34_recover_left_arm_delta",
+    type=str,
+    default="0.0,0.0,0.0,0.35,0.0,0.0,0.0",
+    help="Comma-separated 7-DoF delta added to the current left arm during task 3/4 spread.",
+)
+parser.add_argument(
+    "--task34_recover_right_arm_delta",
+    type=str,
+    default="0.0,0.0,0.0,0.35,0.0,0.0,0.0",
+    help="Comma-separated 7-DoF delta added to the current right arm during task 3/4 spread.",
+)
+parser.add_argument(
     "--tray_carry_xy_margin",
     type=float,
     default=0.10,
@@ -258,6 +324,51 @@ DEX3_JOINT_INDICES = [31, 37, 41, 30, 36, 29, 35, 34, 40, 42, 33, 39, 32, 38]
 SHOULDER_SLICE = (15, 29)
 ACTION_PREFIX_PAD = 15
 ROBOT_ACTION_DIM = ACTION_PREFIX_PAD + len(PERM_TO_REF)
+STATE_JOINT_NAMES = [
+    "kLeftShoulderPitch",
+    "kLeftShoulderRoll",
+    "kLeftShoulderYaw",
+    "kLeftElbow",
+    "kLeftWristRoll",
+    "kLeftWristPitch",
+    "kLeftWristYaw",
+    "kRightShoulderPitch",
+    "kRightShoulderRoll",
+    "kRightShoulderYaw",
+    "kRightElbow",
+    "kRightWristRoll",
+    "kRightWristPitch",
+    "kRightWristYaw",
+    "kLeftHandThumb0",
+    "kLeftHandThumb1",
+    "kLeftHandThumb2",
+    "kLeftHandMiddle0",
+    "kLeftHandMiddle1",
+    "kLeftHandIndex0",
+    "kLeftHandIndex1",
+    "kRightHandThumb0",
+    "kRightHandThumb1",
+    "kRightHandThumb2",
+    "kRightHandIndex0",
+    "kRightHandIndex1",
+    "kRightHandMiddle0",
+    "kRightHandMiddle1",
+]
+
+
+def _format_top_state_errors(current_state_ref: np.ndarray, target_state_ref: np.ndarray, top_k: int = 5) -> str:
+    errors = np.abs(np.asarray(current_state_ref, dtype=np.float32) - np.asarray(target_state_ref, dtype=np.float32))
+    top_indices = np.argsort(errors)[-top_k:][::-1]
+    return ", ".join(
+        f"{STATE_JOINT_NAMES[i]}={errors[i]:.4f}"
+        for i in top_indices
+    )
+
+
+def _task_complete_threshold(task_idx: int) -> float:
+    if task_idx == 2 and args.task3_complete_threshold is not None:
+        return args.task3_complete_threshold
+    return args.task_complete_threshold
 
 
 def _print_controls() -> None:
@@ -266,6 +377,7 @@ def _print_controls() -> None:
     print("  SPACE / P : toggle continuous inference")
     print("  S : run one policy step")
     print("  G : probe task_complete prediction without stepping")
+    print("  T : recover robot toward the current task-start state")
     print("  O : rotate the tray by the configured yaw delta")
     print("  B : rotate the tray back to its reset yaw")
     print("  R : reset the environment")
@@ -323,6 +435,16 @@ def _create_env(task_id: str, device: str):
     for cam_name in CAMERA_KEYS:
         cam_cfg = getattr(env_cfg.scene, cam_name)
         cam_cfg.data_types = ["rgb"]
+    disabled_terms = []
+    for term_name in ("time_out", "task_success", "object_drop"):
+        if hasattr(env_cfg.terminations, term_name):
+            setattr(env_cfg.terminations, term_name, None)
+            disabled_terms.append(term_name)
+    if disabled_terms:
+        print(
+            "[INFO] Disabled env terminations "
+            f"({', '.join(disabled_terms)}); interactive stopping is prediction-driven."
+        )
     env_cfg.recorders = {}
     return gym.make(task_id, cfg=env_cfg).unwrapped
 
@@ -369,8 +491,15 @@ def _get_joint_states(env) -> np.ndarray:
     return states.cpu().numpy().astype(np.float32)
 
 
-def _write_fixed_initial_state_to_sim(env, target_state_ref: np.ndarray) -> None:
-    """Directly teleport the robot's controlled joints to the target state."""
+def _get_current_state_ref(env) -> np.ndarray:
+    return _get_joint_states(env)[0, PERM_TO_REF].copy()
+
+
+def _get_robot_joint_pos(env) -> torch.Tensor:
+    return wp.to_torch(env.scene["robot"].data.joint_pos).clone()
+
+
+def _get_controlled_joint_ids(env) -> torch.Tensor:
     robot = env.scene["robot"]
     action_term = env.action_manager.get_term(env.action_manager.active_terms[0])
     joint_ids = action_term._joint_ids
@@ -380,8 +509,13 @@ def _write_fixed_initial_state_to_sim(env, target_state_ref: np.ndarray) -> None
         )[joint_ids]
     else:
         joint_ids = torch.as_tensor(joint_ids, device=env.device, dtype=torch.long)
-    # Use only the 28 controlled joints (skip prefix pad)
-    joint_ids = joint_ids[ACTION_PREFIX_PAD:].to(dtype=torch.int32)
+    return joint_ids[ACTION_PREFIX_PAD:].to(dtype=torch.int32)
+
+
+def _write_fixed_initial_state_to_sim(env, target_state_ref: np.ndarray) -> None:
+    """Directly teleport the robot's controlled joints to the target state."""
+    robot = env.scene["robot"]
+    joint_ids = _get_controlled_joint_ids(env)
 
     target_internal = np.asarray(target_state_ref, dtype=np.float32)[INV_PERM]
     target_pos = torch.tensor(target_internal, dtype=torch.float32, device=env.device).repeat(env.num_envs, 1)
@@ -389,6 +523,73 @@ def _write_fixed_initial_state_to_sim(env, target_state_ref: np.ndarray) -> None
     env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int32)
     robot.write_joint_position_to_sim_index(position=target_pos, joint_ids=joint_ids, env_ids=env_ids)
     robot.write_joint_velocity_to_sim_index(velocity=target_vel, joint_ids=joint_ids, env_ids=env_ids)
+
+
+def _capture_scene_snapshot(env) -> dict:
+    snapshot = {"articulations": {}, "rigid_objects": {}}
+    for name, asset in getattr(env.scene, "articulations", {}).items():
+        snapshot["articulations"][name] = {
+            "root_state": wp.to_torch(asset.data.root_state_w).clone(),
+            "joint_pos": wp.to_torch(asset.data.joint_pos).clone(),
+            "joint_vel": wp.to_torch(asset.data.joint_vel).clone(),
+        }
+    for name, asset in getattr(env.scene, "rigid_objects", {}).items():
+        snapshot["rigid_objects"][name] = {
+            "root_state": wp.to_torch(asset.data.root_state_w).clone(),
+        }
+    return snapshot
+
+
+def _restore_scene_snapshot(env, snapshot: dict) -> None:
+    env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int32)
+    for name, state in snapshot.get("articulations", {}).items():
+        if name not in env.scene.articulations:
+            continue
+        asset = env.scene.articulations[name]
+        root_state = state["root_state"].to(device=env.device)
+        joint_pos = state["joint_pos"].to(device=env.device)
+        joint_vel = state["joint_vel"].to(device=env.device)
+        asset.write_root_pose_to_sim_index(root_pose=root_state[:, :7], env_ids=env_ids)
+        asset.write_root_velocity_to_sim_index(root_velocity=root_state[:, 7:13], env_ids=env_ids)
+        asset.write_joint_position_to_sim_index(position=joint_pos, env_ids=env_ids)
+        asset.write_joint_velocity_to_sim_index(velocity=joint_vel, env_ids=env_ids)
+    for name, state in snapshot.get("rigid_objects", {}).items():
+        rigid_objects = getattr(env.scene, "rigid_objects", {})
+        if name not in rigid_objects:
+            continue
+        asset = rigid_objects[name]
+        root_state = state["root_state"].to(device=env.device)
+        asset.write_root_pose_to_sim_index(root_pose=root_state[:, :7], env_ids=env_ids)
+        asset.write_root_velocity_to_sim_index(root_velocity=root_state[:, 7:13], env_ids=env_ids)
+    _flush_observations(env)
+
+
+def _make_recover_state_ref(task_idx: int, task_start_state_ref: np.ndarray, current_state_ref: np.ndarray) -> np.ndarray:
+    recover_state_ref = np.asarray(task_start_state_ref, dtype=np.float32).copy()
+    current_state_ref = np.asarray(current_state_ref, dtype=np.float32)
+    if task_idx == 1:
+        # Task 2 recover keeps the left hand/fingers at their current hold pose.
+        recover_state_ref[14:21] = current_state_ref[14:21]
+    elif task_idx >= 3:
+        # Later recoveries keep both hands/fingers holding whatever they currently grasp.
+        recover_state_ref[14:28] = current_state_ref[14:28]
+    return recover_state_ref
+
+
+def _parse_state_delta(value: str, expected_len: int, name: str) -> np.ndarray:
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    if len(parts) != expected_len:
+        raise ValueError(f"{name} must contain {expected_len} comma-separated floats, got {len(parts)}: {value}")
+    return np.asarray([float(p) for p in parts], dtype=np.float32)
+
+
+def _make_task34_recover_spread_state_ref(current_state_ref: np.ndarray) -> np.ndarray:
+    spread_state_ref = np.asarray(current_state_ref, dtype=np.float32).copy()
+    spread_state_ref[0:7] += _parse_state_delta(args.task34_recover_left_arm_delta, 7, "--task34_recover_left_arm_delta")
+    spread_state_ref[7:14] += _parse_state_delta(
+        args.task34_recover_right_arm_delta, 7, "--task34_recover_right_arm_delta"
+    )
+    return spread_state_ref
 
 
 def _apply_fixed_initial_state(
@@ -461,6 +662,66 @@ def _fixed_initial_state_ref_to_raw_action(env, state_ref: np.ndarray) -> np.nda
     raw_action = ((target - offset) / scale).cpu().numpy().astype(np.float32)
     raw_action[:ACTION_PREFIX_PAD] = 0.0
     return raw_action
+
+
+def _state_ref_to_policy_style_action(state_ref: np.ndarray) -> np.ndarray:
+    """Build an env action with the same layout used for GR00T policy outputs."""
+    action_internal = np.asarray(state_ref, dtype=np.float32)[INV_PERM]
+    action = np.concatenate([np.zeros(ACTION_PREFIX_PAD, dtype=np.float32), action_internal], axis=0)
+    return _normalize_env_raw_action(action)
+
+
+def _recover_state_ref_to_action(state_ref: np.ndarray) -> np.ndarray:
+    action = _state_ref_to_policy_style_action(state_ref)
+    # The env action term applies a -0.3 offset to both elbows. Compensate only
+    # those two recover targets; changing the full action mapping drives other
+    # joints toward zero in this interactive setup.
+    action[ACTION_PREFIX_PAD + 3] += 0.3
+    action[ACTION_PREFIX_PAD + 10] += 0.3
+    return action
+
+
+def _drive_state_ref_target(env, target_state_ref: np.ndarray, step_limit: int, tolerance: float) -> dict:
+    raw_action = _recover_state_ref_to_action(target_state_ref)
+    action = torch.tensor(raw_action.reshape(1, ROBOT_ACTION_DIM), dtype=torch.float32, device=env.device)
+    steps_run = 0
+    last_env_step_ms = None
+    max_error = float(np.abs(_get_current_state_ref(env) - target_state_ref).max())
+    for step_idx in range(max(step_limit, 1)):
+        t0 = time.perf_counter()
+        env.step(action)
+        last_env_step_ms = (time.perf_counter() - t0) * 1000.0
+        steps_run = step_idx + 1
+        max_error = float(np.abs(_get_current_state_ref(env) - target_state_ref).max())
+        if max_error <= tolerance:
+            break
+    return {"steps": steps_run, "max_error": max_error, "last_env_step_ms": last_env_step_ms}
+
+
+def _drive_reverse_state_history(env, history: list[np.ndarray], stop_index: int, step_limit: int) -> dict:
+    """Replay recorded robot states backward, one env step per recorded state."""
+    if not history:
+        return {"steps": 0, "max_error": 0.0, "last_env_step_ms": None, "target_index": None}
+    stop_index = max(0, min(stop_index, len(history) - 1))
+    indices = list(range(len(history) - 1, stop_index - 1, -1))[: max(step_limit, 1)]
+    steps_run = 0
+    last_env_step_ms = None
+    target_index = indices[-1] if indices else len(history) - 1
+    max_error = float(np.abs(_get_current_state_ref(env) - history[target_index]).max())
+    for steps_run, state_idx in enumerate(indices, start=1):
+        raw_action = _recover_state_ref_to_action(history[state_idx])
+        action = torch.tensor(raw_action.reshape(1, ROBOT_ACTION_DIM), dtype=torch.float32, device=env.device)
+        t0 = time.perf_counter()
+        env.step(action)
+        last_env_step_ms = (time.perf_counter() - t0) * 1000.0
+        target_index = state_idx
+        max_error = float(np.abs(_get_current_state_ref(env) - history[target_index]).max())
+    return {
+        "steps": steps_run,
+        "max_error": max_error,
+        "last_env_step_ms": last_env_step_ms,
+        "target_index": target_index,
+    }
 
 
 
@@ -678,9 +939,12 @@ class KeyboardInterface:
         self.pending_single_step = False
         self.pending_task_complete_probe = False
         self.pending_reset = False
+        self.pending_recover = False
+        self.pending_recover_task_idx: int | None = None
         self.pending_tray_rotation = False
         self.pending_tray_return = False
         self.selected_task_idx = initial_task_idx
+        self.task_selection_serial = 0
         self.stop_on_task_complete = stop_on_task_complete
         self.last_message = f"Ready. Task {initial_task_idx + 1}: {TASK_DESCRIPTIONS[initial_task_idx]}. Press SPACE."
         self.last_key = "n/a"
@@ -713,6 +977,13 @@ class KeyboardInterface:
         self.pending_reset = False
         return v
 
+    def consume_recover(self) -> tuple[bool, int | None]:
+        v = self.pending_recover
+        task_idx = self.pending_recover_task_idx
+        self.pending_recover = False
+        self.pending_recover_task_idx = None
+        return v, task_idx
+
     def consume_tray_rotation(self) -> bool:
         v = self.pending_tray_rotation
         self.pending_tray_rotation = False
@@ -727,12 +998,30 @@ class KeyboardInterface:
         self.running = not self.running
         self.last_message = f"Continuous inference {'running' if self.running else 'paused'}."
 
+    def select_task(self, idx: int) -> None:
+        self.selected_task_idx = idx
+        self.task_selection_serial += 1
+        self.last_message = f"Selected task {idx + 1}: {TASK_DESCRIPTIONS[idx]}"
+
+    def queue_recover(self, task_idx: int | None = None) -> None:
+        self.running = False
+        self.pending_recover = True
+        self.pending_recover_task_idx = task_idx
+        self.pending_single_step = False
+        self.pending_task_complete_probe = False
+        if task_idx is None:
+            self.last_message = "Queued current task recover."
+        else:
+            self.last_message = f"Queued task {task_idx + 1} recover."
+
     def queue_reset(self) -> None:
         self.running = False
         self.pending_single_step = False
         self.pending_task_complete_probe = False
         self.pending_tray_rotation = False
         self.pending_tray_return = False
+        self.pending_recover = False
+        self.pending_recover_task_idx = None
         self.pending_reset = True
         self.last_message = "Queued environment reset."
 
@@ -758,9 +1047,7 @@ class KeyboardInterface:
 
         for alias in aliases:
             if alias in self._TASK_KEY_MAP:
-                idx = self._TASK_KEY_MAP[alias]
-                self.selected_task_idx = idx
-                self.last_message = f"Selected task {idx + 1}: {TASK_DESCRIPTIONS[idx]}"
+                self.select_task(self._TASK_KEY_MAP[alias])
                 return True
 
         if aliases & {"SPACE", "SPACEBAR", "P"}:
@@ -771,6 +1058,8 @@ class KeyboardInterface:
         elif aliases & {"G"}:
             self.pending_task_complete_probe = True
             self.last_message = "Queued a task_complete probe without env step."
+        elif aliases & {"T"}:
+            self.queue_recover()
         elif aliases & {"O"}:
             self.pending_tray_rotation = True
             self.pending_tray_return = False
@@ -806,9 +1095,7 @@ class StatusPanel:
                         ui.Button(
                             str(idx + 1),
                             width=30,
-                            clicked_fn=lambda i=idx: setattr(keyboard, "selected_task_idx", i) or setattr(
-                                keyboard, "last_message", f"Selected task {i + 1}: {TASK_DESCRIPTIONS[i]}"
-                            ),
+                            clicked_fn=lambda i=idx: keyboard.select_task(i),
                             tooltip=desc,
                         )
                 ui.Label("Controls:", word_wrap=True)
@@ -820,6 +1107,12 @@ class StatusPanel:
                         width=0,
                         clicked_fn=lambda: setattr(keyboard, "pending_task_complete_probe", True),
                         tooltip="Probe task_complete without stepping (G key)",
+                    )
+                    ui.Button(
+                        "Recover",
+                        width=0,
+                        clicked_fn=lambda: keyboard.queue_recover(),
+                        tooltip="Drive robot toward the current task-start state; preserves hand holds for later stages.",
                     )
                     ui.Button("Reset", width=0, clicked_fn=keyboard.queue_reset)
                     ui.Button("Help", width=0, clicked_fn=keyboard.print_help)
@@ -836,7 +1129,7 @@ class StatusPanel:
                     )
                 ui.Spacer(height=4)
                 ui.Label(
-                    "Keys: 1-5 select task  SPACE/P start|pause  S step  G probe TC  O rotate  B back  R reset",
+                    "Keys: 1-5 select task  SPACE/P start|pause  S step  G probe TC  T recover current  O rotate  B back  R reset",
                     word_wrap=True,
                 )
 
@@ -844,7 +1137,6 @@ class StatusPanel:
         self,
         keyboard: KeyboardInterface,
         task_complete_value: float | None,
-        task_complete_peak: float | None,
         step_count: int,
         task_run_step_count: int,
         episode_done: bool,
@@ -863,11 +1155,11 @@ class StatusPanel:
             mode += " / TRAY ROTATING"
 
         tc_text = "n/a" if task_complete_value is None else f"{task_complete_value:.4f}"
-        tc_peak_text = "n/a" if task_complete_peak is None else f"{task_complete_peak:.4f}"
+        tc_threshold = _task_complete_threshold(keyboard.selected_task_idx)
         tc_above = (
             "n/a"
             if task_complete_value is None
-            else str(task_complete_value >= args.task_complete_threshold)
+            else str(task_complete_value >= tc_threshold)
         )
         policy_ms = "n/a" if last_policy_ms is None else f"{last_policy_ms:.0f}"
         env_ms = "n/a" if last_env_step_ms is None else f"{last_env_step_ms:.0f}"
@@ -876,7 +1168,7 @@ class StatusPanel:
         self._status.text = (
             f"Mode: {mode}\n"
             f"Task {keyboard.selected_task_idx + 1}: {task_desc}\n"
-            f"task_complete: {tc_text}  peak={tc_peak_text}  (>= {args.task_complete_threshold:.2f}: {tc_above})\n"
+            f"task_complete: {tc_text}  (>= {tc_threshold:.2f}: {tc_above})\n"
             f"Auto-stop on TC: {keyboard.stop_on_task_complete}\n"
             f"Task run steps: {task_run_step_count} / {args.task_timeout_steps}\n"
             f"Open-loop steps remaining: {open_loop_steps_remaining} / {args.open_loop_steps}\n"
@@ -913,6 +1205,19 @@ def main():
             f"episode={args.fixed_initial_state_episode}, frame={args.fixed_initial_state_frame}"
         )
 
+    task34_recover_state_ref = None
+    task34_recover_dataset = args.task34_recover_reference_dataset or args.fixed_initial_state_dataset
+    if task34_recover_dataset:
+        task34_recover_state_ref = _load_fixed_initial_state_ref(
+            task34_recover_dataset,
+            args.task34_recover_reference_episode,
+            args.task34_recover_reference_frame,
+        )
+        print(
+            f"[INFO] Task 3/4 recover target: dataset={task34_recover_dataset}, "
+            f"episode={args.task34_recover_reference_episode}, frame={args.task34_recover_reference_frame}"
+        )
+
     keyboard = KeyboardInterface(
         stop_on_task_complete=args.enable_task_complete_stop,
         initial_task_idx=args.initial_task,
@@ -930,8 +1235,17 @@ def main():
     task_run_step_count = 0
     episode_done = False
     task_complete_value: float | None = None
-    task_complete_peak: float | None = None
+    previous_task_progress_value: float | None = None
+    task_broken_detection_enabled = False
+    task_stuck_detection_enabled = False
+    task_progress_history: list[float] = []
+    task_start_state_ref: np.ndarray | None = None
+    task_start_state_refs: list[np.ndarray | None] = [None] * len(TASK_DESCRIPTIONS)
+    task_state_histories: list[list[np.ndarray]] = [[] for _ in TASK_DESCRIPTIONS]
     previous_task_idx = keyboard.selected_task_idx
+    previous_task_selection_serial = keyboard.task_selection_serial
+    previous_running = keyboard.running
+    recovered_task_indices: set[int] = set()
     last_policy_ms: float | None = None
     last_env_step_ms: float | None = None
     step_period = 1.0 / max(args.step_hz, 1e-6)
@@ -947,14 +1261,36 @@ def main():
 
     try:
         while simulation_app.is_running():
-            # --- Task switch: clear stale task_complete value ---
-            if keyboard.selected_task_idx != previous_task_idx:
+            # --- Task switch/selection: clear stale task state, even when re-selecting the same task ---
+            if (
+                keyboard.selected_task_idx != previous_task_idx
+                or keyboard.task_selection_serial != previous_task_selection_serial
+            ):
                 previous_task_idx = keyboard.selected_task_idx
+                previous_task_selection_serial = keyboard.task_selection_serial
                 task_complete_value = None
-                task_complete_peak = None
+                previous_task_progress_value = None
+                task_broken_detection_enabled = False
+                task_stuck_detection_enabled = False
+                task_progress_history = []
+                task_start_state_ref = None
+                task_state_histories[keyboard.selected_task_idx] = []
                 task_run_step_count = 0
                 cached_policy_actions = []
                 open_loop_steps_remaining = 0
+
+            # Starting a new attempt should not inherit broken/stuck statistics from a previous run.
+            if keyboard.running and not previous_running:
+                task_complete_value = None
+                previous_task_progress_value = None
+                task_broken_detection_enabled = False
+                task_stuck_detection_enabled = False
+                task_progress_history = []
+                task_run_step_count = 0
+                cached_policy_actions = []
+                open_loop_steps_remaining = 0
+                print(f"[INFO] Starting task {keyboard.selected_task_idx + 1}: cleared progress monitor history.")
+            previous_running = keyboard.running
 
             # --- Reset ---
             if keyboard.consume_reset():
@@ -967,7 +1303,13 @@ def main():
                 task_run_step_count = 0
                 episode_done = False
                 task_complete_value = None
-                task_complete_peak = None
+                previous_task_progress_value = None
+                task_broken_detection_enabled = False
+                task_stuck_detection_enabled = False
+                task_progress_history = []
+                task_start_state_ref = None
+                task_start_state_refs = [None] * len(TASK_DESCRIPTIONS)
+                task_state_histories = [[] for _ in TASK_DESCRIPTIONS]
                 cached_policy_actions = []
                 open_loop_steps_remaining = 0
                 tray_base_yaw_deg = tray_yaw_deg
@@ -975,7 +1317,98 @@ def main():
                 tray_rotation_start_yaw = tray_yaw_deg
                 tray_rotation_target_yaw = tray_yaw_deg
                 tray_rotation_step_count = 0
+                recovered_task_indices.clear()
                 keyboard.last_message = f"Reset done. Tray yaw={tray_yaw_deg:.2f} deg."
+
+            # --- Recover a task by driving only the robot toward that task-start pose ---
+            recover_requested, recover_task_idx = keyboard.consume_recover()
+            if recover_requested:
+                keyboard.running = False
+                cached_policy_actions = []
+                open_loop_steps_remaining = 0
+                tray_rotation_active = False
+                target_task_idx = keyboard.selected_task_idx if recover_task_idx is None else recover_task_idx
+                target_task_start_state_ref = task_start_state_refs[target_task_idx]
+                use_task34_reference = target_task_idx in (2, 3) and task34_recover_state_ref is not None
+                if episode_done:
+                    keyboard.last_message = "Episode done. Press R to reset first."
+                elif target_task_start_state_ref is None and not use_task34_reference:
+                    keyboard.last_message = (
+                        f"No task {target_task_idx + 1} start robot state yet. "
+                        f"Run task {target_task_idx + 1} once before recover."
+                    )
+                else:
+                    keyboard.selected_task_idx = target_task_idx
+                    previous_task_idx = target_task_idx
+                    current_state_ref = _get_current_state_ref(env)
+                    recover_step_limit = max(args.recover_steps, 1)
+                    spread_steps_run = 0
+                    spread_error = None
+                    if use_task34_reference:
+                        if args.task34_recover_spread_steps > 0:
+                            spread_state_ref = _make_task34_recover_spread_state_ref(current_state_ref)
+                            spread_info = _drive_state_ref_target(
+                                env,
+                                spread_state_ref,
+                                args.task34_recover_spread_steps,
+                                args.fixed_initial_state_tolerance,
+                            )
+                            spread_steps_run = int(spread_info["steps"])
+                            spread_error = float(spread_info["max_error"])
+                            last_env_step_ms = spread_info["last_env_step_ms"]
+                            step_count += spread_steps_run
+                        recover_state_ref = task34_recover_state_ref
+                        recover_mode_text = (
+                            f" to reference episode {args.task34_recover_reference_episode} "
+                            f"frame {args.task34_recover_reference_frame}"
+                        )
+                    else:
+                        recover_state_ref = _make_recover_state_ref(
+                            target_task_idx, target_task_start_state_ref, current_state_ref
+                        )
+                        recover_mode_text = " by direct target"
+                    recover_info = _drive_state_ref_target(
+                        env,
+                        recover_state_ref,
+                        recover_step_limit,
+                        args.fixed_initial_state_tolerance,
+                    )
+                    recover_steps_run = int(recover_info["steps"])
+                    recover_error = float(recover_info["max_error"])
+                    last_env_step_ms = recover_info["last_env_step_ms"]
+                    step_count += recover_steps_run
+                    top_recover_errors = _format_top_state_errors(_get_current_state_ref(env), recover_state_ref)
+                    _flush_observations(env)
+                    episode_done = False
+                    task_complete_value = None
+                    previous_task_progress_value = None
+                    task_broken_detection_enabled = False
+                    task_stuck_detection_enabled = False
+                    task_progress_history = []
+                    task_run_step_count = 0
+                    next_task_idx = 2 if target_task_idx == 3 and use_task34_reference else target_task_idx
+                    keyboard.selected_task_idx = next_task_idx
+                    previous_task_idx = next_task_idx
+                    task_start_state_ref = task_start_state_refs[next_task_idx]
+                    recovered_task_indices.add(next_task_idx)
+                    spread_text = (
+                        ""
+                        if spread_steps_run == 0
+                        else f" after spread {spread_steps_run}/{args.task34_recover_spread_steps} steps "
+                        f"(spread_error={spread_error:.4f})"
+                    )
+                    next_step_text = (
+                        " Press Start to redo task 3 before retrying task 4."
+                        if target_task_idx == 3 and next_task_idx == 2
+                        else " Press Start to run task again."
+                    )
+                    keyboard.last_message = (
+                        f"Recovered task {target_task_idx + 1}{recover_mode_text}: "
+                        f"drove robot {spread_text}for {recover_steps_run}/{recover_step_limit} steps "
+                        f"(max_error={recover_error:.4f}) without resetting scene.{next_step_text}"
+                    )
+                    print(f"[INFO] {keyboard.last_message}")
+                    print(f"[INFO] Recover top joint errors: {top_recover_errors}")
 
             # --- Tray rotation ---
             if keyboard.consume_tray_rotation():
@@ -1046,7 +1479,11 @@ def main():
                     executing_policy_step = True
                     if not cached_policy_actions:
                         selected_task_idx = keyboard.selected_task_idx
-                        if args.enable_stage_precondition and selected_task_idx > 0:
+                        if (
+                            args.enable_stage_precondition
+                            and selected_task_idx > 0
+                            and selected_task_idx not in recovered_task_indices
+                        ):
                             required_prev_task_idx = selected_task_idx - 1
                             with torch.inference_mode():
                                 _, previous_progress, last_policy_ms = _probe_task_progress(
@@ -1062,22 +1499,93 @@ def main():
                                 keyboard.last_message = (
                                     f"Blocked task {selected_task_idx + 1}: task {required_prev_task_idx + 1} "
                                     f"progress={previous_progress} < {args.stage_precondition_threshold:.2f}. "
-                                    f"Task {required_prev_task_idx + 1} is not complete."
+                                    f"Select task {required_prev_task_idx + 1} and press Start before retrying "
+                                    f"task {selected_task_idx + 1}."
                                 )
-
+                                print(f"[WARN] {keyboard.last_message}")
                         if should_step:
                             task_desc = TASK_DESCRIPTIONS[keyboard.selected_task_idx]
+                            if task_start_state_ref is None:
+                                task_start_state_ref = _get_current_state_ref(env)
+                                task_start_state_refs[keyboard.selected_task_idx] = task_start_state_ref
+                                task_state_histories[keyboard.selected_task_idx] = [task_start_state_ref.copy()]
+                                previous_task_progress_value = None
+                                task_broken_detection_enabled = False
+                                task_stuck_detection_enabled = False
+                                task_progress_history = []
+                                print(
+                                    f"[INFO] Captured task {keyboard.selected_task_idx + 1} "
+                                    "start robot state for recover."
+                                )
                             with torch.inference_mode():
                                 action_dict, task_complete_value, last_policy_ms = _probe_task_progress(
                                     policy, env, keyboard.selected_task_idx
                                 )
                             if task_complete_value is not None:
-                                task_complete_peak = max(task_complete_peak or 0.0, task_complete_value)
-                            action_chunk = _convert_policy_action_chunk_to_env(action_dict)
-                            if not action_chunk:
-                                raise RuntimeError("Policy returned an empty action chunk.")
-                            cached_policy_actions = [a.copy() for a in action_chunk[: max(args.open_loop_steps, 1)]]
-                            open_loop_steps_remaining = len(cached_policy_actions)
+                                if task_complete_value > args.task_broken_enable_threshold:
+                                    task_broken_detection_enabled = True
+                                if (
+                                    args.task_stuck_window > 1
+                                    and args.task_stuck_min_progress_delta > 0.0
+                                    and
+                                    not task_stuck_detection_enabled
+                                    and task_complete_value > args.task_stuck_enable_threshold
+                                ):
+                                    task_stuck_detection_enabled = True
+                                    task_progress_history = []
+                                progress_drop = (
+                                    0.0
+                                    if previous_task_progress_value is None
+                                    else previous_task_progress_value - task_complete_value
+                                )
+                                broken_due_to_drop = (
+                                    task_broken_detection_enabled
+                                    and args.task_broken_drop_threshold > 0.0
+                                    and progress_drop >= args.task_broken_drop_threshold
+                                )
+                                if task_stuck_detection_enabled:
+                                    task_progress_history.append(task_complete_value)
+                                if len(task_progress_history) > max(args.task_stuck_window, 1):
+                                    task_progress_history = task_progress_history[-max(args.task_stuck_window, 1):]
+                                stuck_delta = 0.0
+                                broken_due_to_stuck = False
+                                if (
+                                    task_stuck_detection_enabled
+                                    and
+                                    args.task_stuck_window > 1
+                                    and args.task_stuck_min_progress_delta > 0.0
+                                    and len(task_progress_history) >= args.task_stuck_window
+                                ):
+                                    stuck_delta = task_progress_history[-1] - task_progress_history[0]
+                                    broken_due_to_stuck = stuck_delta < args.task_stuck_min_progress_delta
+                                if broken_due_to_drop or broken_due_to_stuck:
+                                    keyboard.running = False
+                                    policy_step_requested = False
+                                    executing_policy_step = False
+                                    should_step = False
+                                    cached_policy_actions = []
+                                    open_loop_steps_remaining = 0
+                                    if broken_due_to_drop:
+                                        keyboard.last_message = (
+                                            "task broken, suggest recover "
+                                            f"(progress dropped {progress_drop:.4f} from previous "
+                                            f"{previous_task_progress_value:.4f})."
+                                        )
+                                    else:
+                                        keyboard.last_message = (
+                                            "task broken, suggest recover "
+                                            f"(progress increased only {stuck_delta:.4f} over "
+                                            f"{args.task_stuck_window} predictions)."
+                                        )
+                                    print(f"[WARN] {keyboard.last_message}")
+                                else:
+                                    previous_task_progress_value = task_complete_value
+                            if should_step:
+                                action_chunk = _convert_policy_action_chunk_to_env(action_dict)
+                                if not action_chunk:
+                                    raise RuntimeError("Policy returned an empty action chunk.")
+                                cached_policy_actions = [a.copy() for a in action_chunk[: max(args.open_loop_steps, 1)]]
+                                open_loop_steps_remaining = len(cached_policy_actions)
                     if should_step:
                         action_np = cached_policy_actions.pop(0)
                         action_tensor = _raw_action_to_env_tensor(action_np, device=env.device)
@@ -1128,6 +1636,7 @@ def main():
 
                 if executing_policy_step:
                     open_loop_steps_remaining = len(cached_policy_actions)
+                    task_state_histories[keyboard.selected_task_idx].append(_get_current_state_ref(env))
                     if keyboard.running:
                         task_run_step_count += 1
 
@@ -1138,32 +1647,20 @@ def main():
                     tray_rotation_active = False
                     reason = "terminated" if bool(terminated[0]) else "truncated"
                     keyboard.last_message = f"Episode finished ({reason}). Press R to reset."
-                direct_complete = (
-                    task_complete_value is not None and task_complete_value >= args.task_complete_threshold
-                )
-                drop_complete = (
-                    task_complete_value is not None
-                    and task_complete_peak is not None
-                    and task_complete_peak >= args.task_complete_peak_threshold
-                    and task_complete_value <= args.task_complete_drop_threshold
-                )
+                selected_task_threshold = _task_complete_threshold(keyboard.selected_task_idx)
+                direct_complete = task_complete_value is not None and task_complete_value >= selected_task_threshold
                 if (
                     executing_policy_step
                     and keyboard.running
                     and keyboard.stop_on_task_complete
-                    and (direct_complete or drop_complete)
+                    and direct_complete
                 ):
                     keyboard.running = False
-                    if direct_complete:
-                        keyboard.last_message = (
-                            f"Paused: task_complete={task_complete_value:.4f} "
-                            f">= threshold {args.task_complete_threshold:.2f}."
-                        )
-                    else:
-                        keyboard.last_message = (
-                            f"Paused: task_complete dropped to {task_complete_value:.4f} after "
-                            f"peak={task_complete_peak:.4f}; treating current task as complete."
-                        )
+                    keyboard.last_message = (
+                        f"Paused task {keyboard.selected_task_idx + 1}: task_complete={task_complete_value:.4f} "
+                        f">= threshold {selected_task_threshold:.2f}."
+                    )
+                    print(f"[INFO] {keyboard.last_message}")
                 elif keyboard.running and task_run_step_count >= args.task_timeout_steps:
                     keyboard.running = False
                     keyboard.last_message = (
@@ -1177,7 +1674,6 @@ def main():
             panel.update(
                 keyboard=keyboard,
                 task_complete_value=task_complete_value,
-                task_complete_peak=task_complete_peak,
                 step_count=step_count,
                 task_run_step_count=task_run_step_count,
                 episode_done=episode_done,
