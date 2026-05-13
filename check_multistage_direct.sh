@@ -1,12 +1,14 @@
 ./isaaclab.sh -p scripts/tools/interactive_trocar_task_complete.py \
     --auto_multistage_direct \
     --auto_record_video \
-    --auto_video_dir /home/nvidia/workspace/yiheng/IsaacLab/multistage_direct_videos_100e \
+    --auto_video_dir /home/nvidia/workspace/yiheng/IsaacLab/multistage_direct_videos_100e_chunk4_999 \
     --auto_video_fps 30 \
     --auto_num_episodes 100 \
     --auto_task_indices 0,1,2,3,4 \
-    --auto_task_thresholds 0.98,0.98,0.999,0.98,0.98 \
+    --auto_task_thresholds 0.999,0.999,0.999,0.999,0.95 \
     --auto_total_steps_per_task 300 \
+    --auto_single_attempt_task_indices 0,1 \
+    --auto_hold_height_task_indices "" \
     --auto_no_retry_last_task \
     --model_path /home/nvidia/workspace/yiheng/models/sim6_gr00t_n15_100ksteps_split_stage \
     --gr00t_root /home/nvidia/workspace/yiheng/IsaacLab/Isaac-GR00T \

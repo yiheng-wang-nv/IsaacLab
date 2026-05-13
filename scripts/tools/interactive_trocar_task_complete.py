@@ -117,6 +117,30 @@ parser.add_argument(
     help="In direct multi-stage inference, run the final configured task for only one attempt.",
 )
 parser.add_argument(
+    "--auto_single_attempt_task_indices",
+    type=str,
+    default="0,1",
+    help="Comma-separated zero-based task indices that should run only one attempt in direct mode.",
+)
+parser.add_argument(
+    "--auto_hold_height_task_indices",
+    type=str,
+    default="2,3",
+    help="Comma-separated zero-based task indices where trocars must stay above table height plus margin.",
+)
+parser.add_argument(
+    "--auto_hold_table_height",
+    type=float,
+    default=0.85483,
+    help="Table height used by direct-mode held-trocar failure checks.",
+)
+parser.add_argument(
+    "--auto_hold_height_margin",
+    type=float,
+    default=0.05,
+    help="Margin above table height required during --auto_hold_height_task_indices.",
+)
+parser.add_argument(
     "--auto_record_video",
     action="store_true",
     help="Record the three camera views during direct multi-stage inference.",
@@ -434,6 +458,12 @@ def _parse_index_list(value: str, name: str) -> list[int]:
     return indices
 
 
+def _parse_optional_index_set(value: str, name: str) -> set[int]:
+    if not value.strip():
+        return set()
+    return set(_parse_index_list(value, name))
+
+
 def _parse_float_list(value: str, name: str) -> list[float]:
     parts = [p.strip() for p in value.split(",") if p.strip()]
     if not parts:
@@ -583,6 +613,27 @@ def _get_joint_states(env) -> np.ndarray:
 
 def _get_current_state_ref(env) -> np.ndarray:
     return _get_joint_states(env)[0, PERM_TO_REF].copy()
+
+
+def _get_env_task_stage(env) -> int | None:
+    stage = getattr(env, "_task_stage", None)
+    if stage is None:
+        return None
+    if isinstance(stage, torch.Tensor):
+        return int(stage[0].item())
+    return int(stage[0])
+
+
+def _trocar_dropped(env, drop_height_threshold: float = 0.5) -> bool:
+    pos1 = wp.to_torch(env.scene["trocar_1"].data.root_pos_w)
+    pos2 = wp.to_torch(env.scene["trocar_2"].data.root_pos_w)
+    return bool(((pos1[:, 2] < drop_height_threshold) | (pos2[:, 2] < drop_height_threshold)).any().item())
+
+
+def _trocar_below_height(env, min_height: float) -> bool:
+    pos1 = wp.to_torch(env.scene["trocar_1"].data.root_pos_w)
+    pos2 = wp.to_torch(env.scene["trocar_2"].data.root_pos_w)
+    return bool(((pos1[:, 2] < min_height) | (pos2[:, 2] < min_height)).any().item())
 
 
 def _get_robot_joint_pos(env) -> torch.Tensor:
@@ -851,10 +902,45 @@ class MultiViewVideoRecorder:
         self.fps = float(fps)
         self._writers = {}
         self.frame_count = 0
+        self.overlay_text = ""
 
-    def capture(self, env) -> None:
+    def set_overlay(self, text: str) -> None:
+        self.overlay_text = text
+
+    def _draw_overlay(self, frame: np.ndarray) -> np.ndarray:
+        if not self.overlay_text:
+            return frame
+        frame = frame.copy()
+        text = self.overlay_text
+        font = self._cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.55
+        thickness = 1
+        x, y = 12, 24
+        (text_w, text_h), baseline = self._cv2.getTextSize(text, font, font_scale, thickness)
+        self._cv2.rectangle(
+            frame,
+            (x - 6, y - text_h - 6),
+            (x + text_w + 6, y + baseline + 6),
+            (0, 0, 0),
+            -1,
+        )
+        self._cv2.putText(
+            frame,
+            text,
+            (x, y),
+            font,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            self._cv2.LINE_AA,
+        )
+        return frame
+
+    def capture(self, env, overlay_text: str | None = None) -> None:
+        if overlay_text is not None:
+            self.set_overlay(overlay_text)
         for cam_name in CAMERA_KEYS:
-            frame = _get_camera_rgb(env, cam_name)[0]
+            frame = self._draw_overlay(_get_camera_rgb(env, cam_name)[0])
             writer = self._writers.get(cam_name)
             if writer is None:
                 height, width = frame.shape[:2]
@@ -1335,6 +1421,8 @@ def _auto_recover_task34_reference(
     spread_steps_run = 0
     spread_error = None
     if args.task34_recover_spread_steps > 0:
+        if video_recorder is not None:
+            video_recorder.set_overlay(f"Task {task_idx + 1} RETRY recover spread")
         spread_state_ref = _make_task34_recover_spread_state_ref(current_state_ref)
         spread_info = _drive_state_ref_target(
             env,
@@ -1346,6 +1434,8 @@ def _auto_recover_task34_reference(
         spread_steps_run = int(spread_info["steps"])
         spread_error = float(spread_info["max_error"])
 
+    if video_recorder is not None:
+        video_recorder.set_overlay(f"Task {task_idx + 1} RETRY recover reference")
     recover_info = _drive_state_ref_target(
         env,
         task34_recover_state_ref.copy(),
@@ -1379,6 +1469,15 @@ def _run_direct_multistage(
     video_recorder: MultiViewVideoRecorder | None = None,
 ) -> dict:
     task_indices = _parse_index_list(args.auto_task_indices, "--auto_task_indices")
+    single_attempt_task_indices = _parse_optional_index_set(
+        args.auto_single_attempt_task_indices,
+        "--auto_single_attempt_task_indices",
+    )
+    hold_height_task_indices = _parse_optional_index_set(
+        args.auto_hold_height_task_indices,
+        "--auto_hold_height_task_indices",
+    )
+    min_hold_height = args.auto_hold_table_height + args.auto_hold_height_margin
     thresholds = _direct_task_thresholds(task_indices)
     attempt_step_limit = max(args.task_timeout_steps, 1)
     total_step_limit = max(args.auto_total_steps_per_task, attempt_step_limit)
@@ -1392,6 +1491,9 @@ def _run_direct_multistage(
         "recover_count": 0,
         "failed_task_idx": None,
     }
+    task_attempt_counts = {idx: 0 for idx in task_indices}
+    task_policy_step_counts = {idx: 0 for idx in task_indices}
+    task_start_state_refs: dict[int, np.ndarray] = {}
 
     print(
         "[AUTO] Direct multi-stage inference starting: "
@@ -1401,24 +1503,31 @@ def _run_direct_multistage(
         f"max_attempts={max_attempts}."
     )
     if video_recorder is not None:
-        video_recorder.capture(env)
+        video_recorder.capture(env, "Episode start")
 
-    for task_order_idx, task_idx in enumerate(task_indices):
+    task_order_idx = 0
+    while task_order_idx < len(task_indices):
+        task_idx = task_indices[task_order_idx]
         threshold = thresholds[task_idx]
         is_final_task = task_order_idx == len(task_indices) - 1
-        task_max_attempts = 1 if args.auto_no_retry_last_task and task_order_idx == len(task_indices) - 1 else max_attempts
+        task_max_attempts = (
+            1
+            if task_idx in single_attempt_task_indices or (args.auto_no_retry_last_task and is_final_task)
+            else max_attempts
+        )
         task_total_step_limit = attempt_step_limit if task_max_attempts == 1 else total_step_limit
-        task_policy_steps = 0
         task_success = False
+        task_start_state_refs.setdefault(task_idx, _get_current_state_ref(env).copy())
         task_result = {
             "task_idx": task_idx,
             "task_number": task_idx + 1,
             "threshold": threshold,
             "success": False,
-            "attempts": 0,
-            "policy_steps": 0,
+            "attempts": task_attempt_counts[task_idx],
+            "policy_steps": task_policy_step_counts[task_idx],
             "recover_count": 0,
             "final_progress": None,
+            "env_stage": _get_env_task_stage(env),
         }
         print(
             f"[AUTO] Task {task_idx + 1} start: {TASK_DESCRIPTIONS[task_idx]}, "
@@ -1426,20 +1535,26 @@ def _run_direct_multistage(
             + (" (final success uses env-native task_success)." if is_final_task else ".")
         )
 
-        for attempt_idx in range(1, task_max_attempts + 1):
-            if task_policy_steps >= task_total_step_limit:
+        while task_attempt_counts[task_idx] < task_max_attempts:
+            if task_policy_step_counts[task_idx] >= task_total_step_limit:
                 break
+            task_attempt_counts[task_idx] += 1
+            attempt_idx = task_attempt_counts[task_idx]
             task_result["attempts"] = attempt_idx
             cached_policy_actions: list[np.ndarray] = []
             attempt_steps = 0
             last_progress: float | None = None
+            retry_label = " RETRY" if attempt_idx > 1 or task_result["recover_count"] > 0 else ""
+            overlay_text = f"Task {task_idx + 1}{retry_label} attempt {attempt_idx}/{task_max_attempts}"
+            if video_recorder is not None:
+                video_recorder.set_overlay(overlay_text)
             print(
                 f"[AUTO] Task {task_idx + 1} attempt {attempt_idx}/{task_max_attempts} "
-                f"starting at task_steps={task_policy_steps}/{task_total_step_limit}."
+                f"starting at task_steps={task_policy_step_counts[task_idx]}/{task_total_step_limit}."
             )
 
             while simulation_app.is_running() and attempt_steps < attempt_step_limit:
-                if task_policy_steps >= task_total_step_limit:
+                if task_policy_step_counts[task_idx] >= task_total_step_limit:
                     break
                 if not cached_policy_actions:
                     with torch.inference_mode():
@@ -1468,10 +1583,40 @@ def _run_direct_multistage(
                 _, _, terminated, truncated, _ = env.step(action_tensor)
                 env_step_ms = (time.perf_counter() - t0) * 1000.0
                 total_env_steps += 1
-                task_policy_steps += 1
+                task_policy_step_counts[task_idx] += 1
                 attempt_steps += 1
                 if video_recorder is not None:
-                    video_recorder.capture(env)
+                    video_recorder.capture(env, overlay_text)
+
+                if _trocar_dropped(env):
+                    print(
+                        f"[AUTO] Episode failed: trocar dropped during task {task_idx + 1} "
+                        f"attempt {attempt_idx}."
+                    )
+                    task_result["success"] = False
+                    task_result["policy_steps"] = task_policy_step_counts[task_idx]
+                    task_result["final_progress"] = last_progress
+                    task_result["env_stage"] = _get_env_task_stage(env)
+                    result["tasks"].append(task_result)
+                    result["success_source"] = "trocar_dropped"
+                    result["failed_task_idx"] = task_idx
+                    result["total_policy_steps"] = total_env_steps
+                    return result
+
+                if task_idx in hold_height_task_indices and _trocar_below_height(env, min_hold_height):
+                    print(
+                        f"[AUTO] Episode failed: trocar below held-height threshold during task {task_idx + 1} "
+                        f"(min_height={min_hold_height:.4f})."
+                    )
+                    task_result["success"] = False
+                    task_result["policy_steps"] = task_policy_step_counts[task_idx]
+                    task_result["final_progress"] = last_progress
+                    task_result["env_stage"] = _get_env_task_stage(env)
+                    result["tasks"].append(task_result)
+                    result["success_source"] = "trocar_below_hold_height"
+                    result["failed_task_idx"] = task_idx
+                    result["total_policy_steps"] = total_env_steps
+                    return result
 
                 if bool(terminated[0]) or bool(truncated[0]):
                     reason = "terminated" if bool(terminated[0]) else "truncated"
@@ -1481,8 +1626,9 @@ def _run_direct_multistage(
                     )
                     task_success = True
                     task_result["success"] = True
-                    task_result["policy_steps"] = task_policy_steps
+                    task_result["policy_steps"] = task_policy_step_counts[task_idx]
                     task_result["final_progress"] = last_progress
+                    task_result["env_stage"] = _get_env_task_stage(env)
                     result["tasks"].append(task_result)
                     result["success"] = bool(terminated[0])
                     result["success_source"] = "env_task_success" if bool(terminated[0]) else "env_truncated"
@@ -1508,12 +1654,12 @@ def _run_direct_multistage(
             print(
                 f"[AUTO] Task {task_idx + 1} attempt {attempt_idx} ended at "
                 f"progress={last_progress} after {attempt_steps}/{attempt_step_limit} steps "
-                f"(task_steps={task_policy_steps}/{task_total_step_limit})."
+                f"(task_steps={task_policy_step_counts[task_idx]}/{task_total_step_limit})."
             )
 
             if (
                 task_idx == 2
-                and task_policy_steps < task_total_step_limit
+                and task_policy_step_counts[task_idx] < task_total_step_limit
                 and attempt_idx < task_max_attempts
                 and task34_recover_state_ref is not None
             ):
@@ -1521,30 +1667,78 @@ def _run_direct_multistage(
                 _auto_recover_task34_reference(env, task_idx, task34_recover_state_ref, video_recorder)
                 task_result["recover_count"] += 1
                 result["recover_count"] += 1
+                if _trocar_dropped(env):
+                    print("[AUTO] Episode failed: trocar dropped during task 3 recover.")
+                    task_result["success"] = False
+                    task_result["policy_steps"] = task_policy_step_counts[task_idx]
+                    task_result["env_stage"] = _get_env_task_stage(env)
+                    result["tasks"].append(task_result)
+                    result["success_source"] = "trocar_dropped"
+                    result["failed_task_idx"] = task_idx
+                    result["total_policy_steps"] = total_env_steps
+                    return result
             elif task_idx == 2 and task34_recover_state_ref is None:
                 print("[AUTO] Task 3 recover target is unavailable; retrying without recover.")
 
+            if (
+                task_idx == 3
+                and task_policy_step_counts[task_idx] < task_total_step_limit
+                and attempt_idx < task_max_attempts
+                and 2 in task_start_state_refs
+            ):
+                print("[AUTO] Task 4 attempt failed; returning robot to task 3 start and rerunning task 3.")
+                if video_recorder is not None:
+                    video_recorder.set_overlay("Task 4 RETRY return to task 3 start")
+                _drive_state_ref_target(
+                    env,
+                    task_start_state_refs[2],
+                    max(args.recover_steps, 1),
+                    args.fixed_initial_state_tolerance,
+                    on_step=None if video_recorder is None else lambda: video_recorder.capture(env),
+                )
+                if _trocar_dropped(env):
+                    print("[AUTO] Episode failed: trocar dropped while returning to task 3 start.")
+                    task_result["success"] = False
+                    task_result["policy_steps"] = task_policy_step_counts[task_idx]
+                    task_result["env_stage"] = _get_env_task_stage(env)
+                    result["tasks"].append(task_result)
+                    result["success_source"] = "trocar_dropped"
+                    result["failed_task_idx"] = task_idx
+                    result["total_policy_steps"] = total_env_steps
+                    return result
+                task_result["success"] = False
+                task_result["policy_steps"] = task_policy_step_counts[task_idx]
+                task_result["env_stage"] = _get_env_task_stage(env)
+                result["tasks"].append(task_result)
+                task_order_idx = task_indices.index(2)
+                break
+
         task_result["success"] = task_success
-        task_result["policy_steps"] = task_policy_steps
+        task_result["policy_steps"] = task_policy_step_counts[task_idx]
+        task_result["env_stage"] = _get_env_task_stage(env)
         if task_success and task_result["final_progress"] is None:
             with torch.inference_mode():
                 _, final_progress, _ = _probe_task_progress(policy, env, task_idx)
             task_result["final_progress"] = final_progress
-        result["tasks"].append(task_result)
+        if not result["tasks"] or result["tasks"][-1] is not task_result:
+            result["tasks"].append(task_result)
 
         if not task_success:
+            if task_idx == 3 and task_order_idx == task_indices.index(2):
+                continue
             print(
                 f"[AUTO] Task {task_idx + 1} failed to reach threshold {threshold:.4f} "
-                f"within {task_policy_steps}/{task_total_step_limit} policy steps."
+                f"within {task_policy_step_counts[task_idx]}/{task_total_step_limit} policy steps."
             )
             result["failed_task_idx"] = task_idx
             result["total_policy_steps"] = total_env_steps
             return result
 
         print(
-            f"[AUTO] Task {task_idx + 1} complete after {task_policy_steps} policy steps. "
+            f"[AUTO] Task {task_idx + 1} complete after {task_policy_step_counts[task_idx]} policy steps. "
             "Advancing to next task."
         )
+        task_order_idx += 1
 
     print(f"[AUTO] Direct multi-stage inference finished successfully after {total_env_steps} policy env steps.")
     result["success"] = True
@@ -1589,6 +1783,7 @@ def _run_direct_multistage_episodes(
             episode_results.append(episode_result)
             success = bool(episode_result["success"])
             all_success = all_success and success
+            _write_direct_success_status(episode_results)
             print(
                 f"[AUTO] ===== Episode {episode_idx + 1}/{episode_count} "
                 f"{'succeeded' if success else 'failed'} ====="
@@ -1644,6 +1839,38 @@ def _write_direct_multistage_results(episode_results: list[dict]) -> None:
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"[AUTO] Wrote direct multi-stage summary: {summary_path}")
+
+
+def _write_direct_success_status(episode_results: list[dict]) -> None:
+    video_dir = Path(args.auto_video_dir)
+    video_dir.mkdir(parents=True, exist_ok=True)
+    success_path = video_dir / "success.json"
+    success_count = sum(1 for item in episode_results if item["success"])
+    payload = {
+        "completed_episodes": len(episode_results),
+        "success_count": success_count,
+        "failure_count": len(episode_results) - success_count,
+        "success_rate": success_count / max(len(episode_results), 1),
+        "episodes": [
+            {
+                "episode_idx": item["episode_idx"],
+                "success": item["success"],
+                "success_source": item.get("success_source"),
+                "failed_task_idx": item.get("failed_task_idx"),
+                "failed_task_number": (
+                    None
+                    if item.get("failed_task_idx") is None
+                    else int(item["failed_task_idx"]) + 1
+                ),
+                "total_policy_steps": item.get("total_policy_steps"),
+                "recover_count": item.get("recover_count", 0),
+            }
+            for item in episode_results
+        ],
+    }
+    tmp_path = success_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(success_path)
 
 
 def main():
