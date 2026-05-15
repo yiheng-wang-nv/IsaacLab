@@ -1422,7 +1422,7 @@ def _auto_recover_task34_reference(
     spread_error = None
     if args.task34_recover_spread_steps > 0:
         if video_recorder is not None:
-            video_recorder.set_overlay(f"Task {task_idx + 1} RETRY recover spread")
+            video_recorder.set_overlay(f"Task {task_idx + 1} RETRY")
         spread_state_ref = _make_task34_recover_spread_state_ref(current_state_ref)
         spread_info = _drive_state_ref_target(
             env,
@@ -1435,7 +1435,7 @@ def _auto_recover_task34_reference(
         spread_error = float(spread_info["max_error"])
 
     if video_recorder is not None:
-        video_recorder.set_overlay(f"Task {task_idx + 1} RETRY recover reference")
+        video_recorder.set_overlay(f"Task {task_idx + 1} RETRY")
     recover_info = _drive_state_ref_target(
         env,
         task34_recover_state_ref.copy(),
@@ -1545,7 +1545,7 @@ def _run_direct_multistage(
             attempt_steps = 0
             last_progress: float | None = None
             retry_label = " RETRY" if attempt_idx > 1 or task_result["recover_count"] > 0 else ""
-            overlay_text = f"Task {task_idx + 1}{retry_label} attempt {attempt_idx}/{task_max_attempts}"
+            overlay_text = f"Task {task_idx + 1}{retry_label}"
             if video_recorder is not None:
                 video_recorder.set_overlay(overlay_text)
             print(
@@ -1688,7 +1688,7 @@ def _run_direct_multistage(
             ):
                 print("[AUTO] Task 4 attempt failed; returning robot to task 3 start and rerunning task 3.")
                 if video_recorder is not None:
-                    video_recorder.set_overlay("Task 4 RETRY return to task 3 start")
+                    video_recorder.set_overlay("Task 4 RETRY")
                 _drive_state_ref_target(
                     env,
                     task_start_state_refs[2],

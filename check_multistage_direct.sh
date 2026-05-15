@@ -1,7 +1,7 @@
 ./isaaclab.sh -p scripts/tools/interactive_trocar_task_complete.py \
     --auto_multistage_direct \
     --auto_record_video \
-    --auto_video_dir /home/nvidia/workspace/yiheng/IsaacLab/multistage_direct_videos_100e_chunk4_999 \
+    --auto_video_dir /home/nvidia/workspace/yiheng/IsaacLab/multistage_direct_videos_100e_chunk4_999_new_t4_retry \
     --auto_video_fps 30 \
     --auto_num_episodes 100 \
     --auto_task_indices 0,1,2,3,4 \

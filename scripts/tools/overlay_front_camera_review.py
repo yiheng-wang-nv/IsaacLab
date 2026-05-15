@@ -81,7 +81,9 @@ def label_segments(ep: dict, fps: float) -> list[tuple[float, float, str]]:
                 label += " RETRY"
             add(steps, label)
             if task_number == 3 and attempt_idx < attempts:
-                add(60, "Task 3 RETRY")
+                add(60, "Task 4 RETRY" if task4_retry_context else "Task 3 RETRY")
+            if task_number == 4 and attempt_idx < attempts:
+                add(60, "Task 4 RETRY")
 
         if task_number == 4 and not bool(task.get("success")):
             add(30, "Task 4 RETRY")
