@@ -391,6 +391,14 @@ TASK_DESCRIPTIONS = [
     "place trocar",
 ]
 
+TASK_OVERLAY_LABELS = [
+    "Left trocar pickup",
+    "Right trocar pickup",
+    "Align trocars",
+    "Insert trocar",
+    "Placement",
+]
+
 CAMERA_KEYS = ["front_camera", "left_wrist_camera", "right_wrist_camera"]
 
 PERM_TO_REF = list(range(28))  # identity — dataset recorded with record_trocar_episodes.py
@@ -496,6 +504,11 @@ def _print_controls() -> None:
     print("  B : rotate the tray back to its reset yaw")
     print("  R : reset the environment")
     print("  H : print this help again")
+
+
+def _task_overlay_label(task_idx: int, retry: bool = False) -> str:
+    label = TASK_OVERLAY_LABELS[task_idx] if 0 <= task_idx < len(TASK_OVERLAY_LABELS) else f"Task {task_idx + 1}"
+    return f"{label} RETRY" if retry else label
 
 
 def _find_isaac_gr00t_root(model_path: Path, gr00t_root: str | None = None) -> Path:
@@ -1422,7 +1435,7 @@ def _auto_recover_task34_reference(
     spread_error = None
     if args.task34_recover_spread_steps > 0:
         if video_recorder is not None:
-            video_recorder.set_overlay(f"Task {task_idx + 1} RETRY")
+            video_recorder.set_overlay(_task_overlay_label(task_idx, retry=True))
         spread_state_ref = _make_task34_recover_spread_state_ref(current_state_ref)
         spread_info = _drive_state_ref_target(
             env,
@@ -1435,7 +1448,7 @@ def _auto_recover_task34_reference(
         spread_error = float(spread_info["max_error"])
 
     if video_recorder is not None:
-        video_recorder.set_overlay(f"Task {task_idx + 1} RETRY")
+        video_recorder.set_overlay(_task_overlay_label(task_idx, retry=True))
     recover_info = _drive_state_ref_target(
         env,
         task34_recover_state_ref.copy(),
@@ -1544,8 +1557,10 @@ def _run_direct_multistage(
             cached_policy_actions: list[np.ndarray] = []
             attempt_steps = 0
             last_progress: float | None = None
-            retry_label = " RETRY" if attempt_idx > 1 or task_result["recover_count"] > 0 else ""
-            overlay_text = f"Task {task_idx + 1}{retry_label}"
+            overlay_text = _task_overlay_label(
+                task_idx,
+                retry=attempt_idx > 1 or task_result["recover_count"] > 0,
+            )
             if video_recorder is not None:
                 video_recorder.set_overlay(overlay_text)
             print(
@@ -1688,7 +1703,7 @@ def _run_direct_multistage(
             ):
                 print("[AUTO] Task 4 attempt failed; returning robot to task 3 start and rerunning task 3.")
                 if video_recorder is not None:
-                    video_recorder.set_overlay("Task 4 RETRY")
+                    video_recorder.set_overlay(_task_overlay_label(3, retry=True))
                 _drive_state_ref_target(
                     env,
                     task_start_state_refs[2],

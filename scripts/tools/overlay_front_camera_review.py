@@ -9,6 +9,20 @@ from datetime import datetime
 from pathlib import Path
 
 
+TASK_OVERLAY_LABELS = {
+    1: "Left trocar pickup",
+    2: "Right trocar pickup",
+    3: "Align trocars",
+    4: "Insert trocar",
+    5: "Placement",
+}
+
+
+def task_overlay_label(task_number: int, retry: bool = False) -> str:
+    label = TASK_OVERLAY_LABELS.get(task_number, f"Task {task_number}")
+    return f"{label} RETRY" if retry else label
+
+
 def retry_reasons(ep: dict) -> list[str]:
     tasks = ep.get("tasks", [])
     nums = [t.get("task_number") for t in tasks]
@@ -76,17 +90,16 @@ def label_segments(ep: dict, fps: float) -> list[tuple[float, float, str]]:
                 task_number == 4 and occurrence > 0
             )
             retry = attempt_idx > 1 or occurrence > 0
-            label = "Task 4 RETRY" if task4_retry_context else f"Task {task_number}"
-            if retry and not task4_retry_context:
-                label += " RETRY"
+            label_task_number = 4 if task4_retry_context else task_number
+            label = task_overlay_label(label_task_number, retry or task4_retry_context)
             add(steps, label)
             if task_number == 3 and attempt_idx < attempts:
-                add(60, "Task 4 RETRY" if task4_retry_context else "Task 3 RETRY")
+                add(60, task_overlay_label(4 if task4_retry_context else 3, retry=True))
             if task_number == 4 and attempt_idx < attempts:
-                add(60, "Task 4 RETRY")
+                add(60, task_overlay_label(4, retry=True))
 
         if task_number == 4 and not bool(task.get("success")):
-            add(30, "Task 4 RETRY")
+            add(30, task_overlay_label(4, retry=True))
 
     return segments
 
