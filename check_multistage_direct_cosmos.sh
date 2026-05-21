@@ -1,26 +1,26 @@
-OPEN_LOOP_STEPS="${1:-${OPEN_LOOP_STEPS:-4}}"
-VIDEO_DIR="/home/nvidia/workspace/yiheng/IsaacLab/retry_test_rand_0_10_chunk${OPEN_LOOP_STEPS}"
-
 ./isaaclab.sh -p scripts/tools/interactive_trocar_task_complete.py \
     --auto_multistage_direct \
     --auto_record_video \
-    --auto_video_dir "${VIDEO_DIR}" \
+    --auto_video_dir /home/nvidia/workspace/yiheng/IsaacLab/multistage_direct_videos_10e_cosmos_reason2_every60_rand_0_10 \
     --auto_video_fps 30 \
-    --auto_num_episodes 100 \
+    --auto_num_episodes 3 \
     --auto_task_indices 0,1,2,3,4 \
-    --auto_task_thresholds 0.999,0.999,0.9999,0.95,0.95 \
     --auto_total_steps_per_task 300 \
-    --auto_single_attempt_task_indices 0,1 \
-    --auto_timeout_advance_task_indices 0,1,3 \
-    --auto_timeout_then_threshold_task_indices 2 \
-    --auto_timeout_then_env_success_task_indices 4 \
+    --cosmos_reasoning_mode direct_manager \
+    --cosmos_base_url http://localhost:8000/v1 \
+    --cosmos_model nvidia/Cosmos-Reason2-2B \
+    --cosmos_prompt_path /home/nvidia/workspace/yiheng/IsaacLab/cosmos_trocar_direct_manager.yaml \
+    --cosmos_decision_interval_steps 60 \
+    --cosmos_context_frames 1 \
+    --cosmos_decision_timeout_s 120 \
     --auto_hold_height_task_indices "" \
     --auto_no_retry_last_task \
+    --auto_task_thresholds 0.999,0.999,0.9995,0.95,0.95 \
     --model_path /home/nvidia/workspace/yiheng/models/sim6_gr00t_n15_100ksteps_split_stage \
     --gr00t_root /home/nvidia/workspace/yiheng/IsaacLab/Isaac-GR00T \
     --progress_regressor_path /home/nvidia/workspace/yiheng/models/task_progress_regressor_ordered/best_model.pt \
     --device cuda:0 \
-    --open_loop_steps "${OPEN_LOOP_STEPS}" \
+    --open_loop_steps 4 \
     --task_timeout_steps 60 \
     --fixed_initial_state_dataset /home/nvidia/workspace/yiheng/datasets/trocar_success_lt_7s_split_by_stage_task_complete \
     --fixed_initial_state_episode 0 \
@@ -32,9 +32,9 @@ VIDEO_DIR="/home/nvidia/workspace/yiheng/IsaacLab/retry_test_rand_0_10_chunk${OP
     --task34_recover_spread_steps 30 \
     --task34_recover_left_arm_delta 0.0,0.0,0.35,0.0,0.0,0.0,0.0 \
     --task34_recover_right_arm_delta 0.0,0.0,-0.35,0.0,0.0,0.0,0.0 \
+    --tray_yaw_increment_deg -10 \
     --initial_tray_yaw_min_deg 0 \
     --initial_tray_yaw_max_deg 10 \
-    --fixed_initial_state_tolerance 0.035 --seed 42 --task_complete_threshold 0.98 \
-    --task3_complete_threshold 0.999 \
-    --task_broken_drop_threshold 0.30 \
-    --stage_precondition_threshold 0.95
+    --fixed_initial_state_tolerance 0.035 --seed 42 \
+    --task_broken_drop_threshold 0.30
+

@@ -1,5 +1,5 @@
 OPEN_LOOP_STEPS="${1:-${OPEN_LOOP_STEPS:-4}}"
-VIDEO_DIR="/home/nvidia/workspace/yiheng/IsaacLab/retry_test_rand_0_10_chunk${OPEN_LOOP_STEPS}"
+VIDEO_DIR="/home/nvidia/workspace/yiheng/IsaacLab/multistage_direct_videos_100e_timeout_only_60_rand_0_10_chunk${OPEN_LOOP_STEPS}"
 
 ./isaaclab.sh -p scripts/tools/interactive_trocar_task_complete.py \
     --auto_multistage_direct \
@@ -8,11 +8,9 @@ VIDEO_DIR="/home/nvidia/workspace/yiheng/IsaacLab/retry_test_rand_0_10_chunk${OP
     --auto_video_fps 30 \
     --auto_num_episodes 100 \
     --auto_task_indices 0,1,2,3,4 \
-    --auto_task_thresholds 0.999,0.999,0.9999,0.95,0.95 \
-    --auto_total_steps_per_task 300 \
-    --auto_single_attempt_task_indices 0,1 \
-    --auto_timeout_advance_task_indices 0,1,3 \
-    --auto_timeout_then_threshold_task_indices 2 \
+    --auto_total_steps_per_task 60 \
+    --auto_single_attempt_task_indices 0,1,2,3,4 \
+    --auto_timeout_advance_task_indices 0,1,2,3 \
     --auto_timeout_then_env_success_task_indices 4 \
     --auto_hold_height_task_indices "" \
     --auto_no_retry_last_task \
@@ -32,9 +30,9 @@ VIDEO_DIR="/home/nvidia/workspace/yiheng/IsaacLab/retry_test_rand_0_10_chunk${OP
     --task34_recover_spread_steps 30 \
     --task34_recover_left_arm_delta 0.0,0.0,0.35,0.0,0.0,0.0,0.0 \
     --task34_recover_right_arm_delta 0.0,0.0,-0.35,0.0,0.0,0.0,0.0 \
+    --tray_yaw_increment_deg -10 \
     --initial_tray_yaw_min_deg 0 \
     --initial_tray_yaw_max_deg 10 \
-    --fixed_initial_state_tolerance 0.035 --seed 42 --task_complete_threshold 0.98 \
-    --task3_complete_threshold 0.999 \
-    --task_broken_drop_threshold 0.30 \
-    --stage_precondition_threshold 0.95
+    --fixed_initial_state_tolerance 0.035 --seed 42 \
+    --task_broken_drop_threshold 0.30
+

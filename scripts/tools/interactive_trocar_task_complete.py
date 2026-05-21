@@ -30,6 +30,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
@@ -123,6 +124,42 @@ parser.add_argument(
     help="Comma-separated zero-based task indices that should run only one attempt in direct mode.",
 )
 parser.add_argument(
+    "--auto_timeout_advance_task_indices",
+    type=str,
+    default="",
+    help=(
+        "Comma-separated zero-based task indices that should advance after "
+        "--task_timeout_steps instead of using the task_complete threshold."
+    ),
+)
+parser.add_argument(
+    "--auto_timeout_advance_early_stop_threshold",
+    type=float,
+    default=-1.0,
+    help=(
+        "Optional early-stop threshold for --auto_timeout_advance_task_indices. "
+        "If non-negative, timeout-advance tasks advance before timeout when task_complete reaches this value."
+    ),
+)
+parser.add_argument(
+    "--auto_timeout_then_threshold_task_indices",
+    type=str,
+    default="",
+    help=(
+        "Comma-separated zero-based task indices that should always run until "
+        "--task_timeout_steps, then check task_complete threshold."
+    ),
+)
+parser.add_argument(
+    "--auto_timeout_then_env_success_task_indices",
+    type=str,
+    default="",
+    help=(
+        "Comma-separated zero-based task indices that should always run until "
+        "--task_timeout_steps, then check the env-native task success condition."
+    ),
+)
+parser.add_argument(
     "--auto_hold_height_task_indices",
     type=str,
     default="2,3",
@@ -156,6 +193,61 @@ parser.add_argument(
     type=float,
     default=30.0,
     help="FPS used when writing direct multi-stage videos.",
+)
+parser.add_argument(
+    "--cosmos_reasoning_mode",
+    type=str,
+    choices=["off", "direct_manager"],
+    default="off",
+    help="Use Cosmos Reason2 as the high-level direct-mode stage manager.",
+)
+parser.add_argument(
+    "--cosmos_base_url",
+    type=str,
+    default="http://localhost:8000/v1",
+    help="OpenAI-compatible vLLM base URL for Cosmos Reason2.",
+)
+parser.add_argument(
+    "--cosmos_model",
+    type=str,
+    default="nvidia/Cosmos-Reason2-2B",
+    help="Cosmos Reason2 model id served by vLLM.",
+)
+parser.add_argument(
+    "--cosmos_prompt_path",
+    type=str,
+    default=str(Path(__file__).resolve().parent / "prompts" / "cosmos_trocar_direct_manager.yaml"),
+    help="Prompt YAML used by the Cosmos direct manager.",
+)
+parser.add_argument(
+    "--cosmos_decision_interval_steps",
+    type=int,
+    default=10,
+    help="Ask Cosmos for a high-level decision every N env policy steps.",
+)
+parser.add_argument(
+    "--cosmos_context_frames",
+    type=int,
+    default=1,
+    help="Number of recent Cosmos decision snapshots to send as visual context.",
+)
+parser.add_argument(
+    "--cosmos_decision_timeout_s",
+    type=float,
+    default=120.0,
+    help="HTTP timeout for one Cosmos decision request.",
+)
+parser.add_argument(
+    "--cosmos_max_total_steps",
+    type=int,
+    default=0,
+    help="Hard episode step cap in Cosmos mode. Defaults to auto_total_steps_per_task * number of tasks.",
+)
+parser.add_argument(
+    "--cosmos_retry_failure_progress_threshold",
+    type=float,
+    default=0.2,
+    help="In Cosmos mode, fail the episode after at least one retry if task progress falls below this value. Set below 0 to disable.",
 )
 parser.add_argument(
     "--task_broken_drop_threshold",
@@ -382,6 +474,8 @@ import warp as wp
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
+from cosmos_reason2_direct_manager import CosmosDecision, CosmosReason2DirectManager
+
 
 TASK_DESCRIPTIONS = [
     "left hand pick up trocar",
@@ -507,8 +601,7 @@ def _print_controls() -> None:
 
 
 def _task_overlay_label(task_idx: int, retry: bool = False) -> str:
-    label = TASK_OVERLAY_LABELS[task_idx] if 0 <= task_idx < len(TASK_OVERLAY_LABELS) else f"Task {task_idx + 1}"
-    return f"{label} RETRY" if retry else label
+    return "RETRY" if retry else ""
 
 
 def _find_isaac_gr00t_root(model_path: Path, gr00t_root: str | None = None) -> Path:
@@ -563,17 +656,36 @@ def _create_env(task_id: str, device: str):
         cam_cfg = getattr(env_cfg.scene, cam_name)
         cam_cfg.data_types = ["rgb"]
     disabled_terms = []
-    terminations_to_disable = ("time_out", "object_drop") if args.auto_multistage_direct else (
-        "time_out",
-        "task_success",
-        "object_drop",
-    )
+    if args.auto_multistage_direct:
+        if args.cosmos_reasoning_mode == "direct_manager":
+            terminations_to_disable = ["time_out", "task_success", "object_drop"]
+        else:
+            terminations_to_disable = ["time_out", "object_drop"]
+            task_indices = _parse_index_list(args.auto_task_indices, "--auto_task_indices")
+            timeout_advance_task_indices = _parse_optional_index_set(
+                args.auto_timeout_advance_task_indices,
+                "--auto_timeout_advance_task_indices",
+            )
+            timeout_then_env_success_task_indices = _parse_optional_index_set(
+                args.auto_timeout_then_env_success_task_indices,
+                "--auto_timeout_then_env_success_task_indices",
+            )
+            if task_indices[-1] in timeout_advance_task_indices or task_indices[-1] in timeout_then_env_success_task_indices:
+                terminations_to_disable.append("task_success")
+    else:
+        terminations_to_disable = ["time_out", "task_success", "object_drop"]
     for term_name in terminations_to_disable:
         if hasattr(env_cfg.terminations, term_name):
             setattr(env_cfg.terminations, term_name, None)
             disabled_terms.append(term_name)
     if disabled_terms:
-        mode_text = "direct success is env-native" if args.auto_multistage_direct else "interactive stopping is prediction-driven"
+        mode_text = (
+            "Cosmos controls stage transitions; final success is env-native"
+            if args.auto_multistage_direct and args.cosmos_reasoning_mode == "direct_manager"
+            else "direct success is env-native"
+            if args.auto_multistage_direct
+            else "interactive stopping is prediction-driven"
+        )
         print(
             "[INFO] Disabled env terminations "
             f"({', '.join(disabled_terms)}); {mode_text}."
@@ -635,6 +747,11 @@ def _get_env_task_stage(env) -> int | None:
     if isinstance(stage, torch.Tensor):
         return int(stage[0].item())
     return int(stage[0])
+
+
+def _env_task_success(env) -> bool:
+    stage = _get_env_task_stage(env)
+    return stage is not None and stage >= 4
 
 
 def _trocar_dropped(env, drop_height_threshold: float = 0.5) -> bool:
@@ -1169,6 +1286,119 @@ def _probe_task_progress(policy, env, task_idx: int):
     return action_dict, progress, policy_ms
 
 
+def _make_cosmos_direct_manager() -> CosmosReason2DirectManager:
+    return CosmosReason2DirectManager(
+        base_url=args.cosmos_base_url,
+        model=args.cosmos_model,
+        prompt_path=args.cosmos_prompt_path,
+        timeout_s=args.cosmos_decision_timeout_s,
+    )
+
+
+def _round_float_list(values: np.ndarray, decimals: int = 4) -> list[float]:
+    return [round(float(value), decimals) for value in np.asarray(values, dtype=np.float32).reshape(-1)]
+
+
+def _cosmos_camera_frames(env) -> dict[str, np.ndarray]:
+    return {cam_name: _get_camera_rgb(env, cam_name)[0] for cam_name in CAMERA_KEYS}
+
+
+def _cosmos_decision_log_path() -> Path:
+    return Path(args.auto_video_dir) / "cosmos_decisions.jsonl"
+
+
+def _append_jsonl(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+
+def _build_cosmos_context(
+    *,
+    task_idx: int,
+    last_progress: float | None,
+    threshold_hint: float | None,
+    task_retry_count: int,
+    task_elapsed_steps: int,
+    timeout_steps: int,
+    total_env_steps: int,
+    progress_probe_ms: float | None = None,
+) -> dict:
+    return {
+        "current_task_index": task_idx,
+        "current_task_description": TASK_DESCRIPTIONS[task_idx],
+        "complete_probability": last_progress,
+        "threshold_hint": threshold_hint,
+        "task_retry_count": task_retry_count,
+        "task_elapsed_steps": task_elapsed_steps,
+        "timeout_steps": timeout_steps,
+        "total_env_steps": total_env_steps,
+        "progress_probe_ms": progress_probe_ms,
+    }
+
+
+def _new_direct_task_result(
+    *,
+    task_idx: int,
+    attempts: int,
+    policy_steps: int,
+    threshold: float | None,
+    env,
+) -> dict:
+    return {
+        "task_idx": task_idx,
+        "task_number": task_idx + 1,
+        "threshold": threshold,
+        "success": False,
+        "attempts": attempts,
+        "policy_steps": policy_steps,
+        "recover_count": 0,
+        "final_progress": None,
+        "env_stage": _get_env_task_stage(env),
+        "success_source": None,
+    }
+
+
+def _finalize_direct_task_result(
+    task_result: dict,
+    *,
+    success: bool,
+    success_source: str,
+    policy_steps: int,
+    final_progress: float | None,
+    env,
+) -> None:
+    task_result["success"] = success
+    task_result["success_source"] = success_source
+    task_result["policy_steps"] = policy_steps
+    task_result["final_progress"] = final_progress
+    task_result["env_stage"] = _get_env_task_stage(env)
+
+
+def _run_cosmos_recover(
+    *,
+    env,
+    task_idx: int,
+    task_start_state_refs: dict[int, np.ndarray],
+    task34_recover_state_ref: np.ndarray | None,
+    video_recorder: MultiViewVideoRecorder | None,
+) -> dict:
+    if task_idx in (2, 3) and task34_recover_state_ref is not None:
+        return _auto_recover_task34_reference(env, task_idx, task34_recover_state_ref, video_recorder)
+
+    start_state_ref = task_start_state_refs.get(task_idx)
+    if start_state_ref is None:
+        return {"recover_skipped": "missing_task_start_state"}
+    info = _drive_state_ref_target(
+        env,
+        start_state_ref,
+        max(args.recover_steps, 1),
+        args.fixed_initial_state_tolerance,
+        on_step=None if video_recorder is None else lambda: video_recorder.capture(env),
+    )
+    return {"recover_steps": int(info["steps"]), "recover_error": float(info["max_error"])}
+
+
 class KeyboardInterface:
     _TASK_KEY_MAP = {
         "1": 0, "KEY_1": 0, "NUMPAD_1": 0,
@@ -1431,6 +1661,8 @@ def _auto_recover_task34_reference(
     video_recorder: MultiViewVideoRecorder | None = None,
 ) -> dict:
     current_state_ref = _get_current_state_ref(env)
+    recover_target_ref = task34_recover_state_ref.copy()
+    recover_target_ref[14:28] = current_state_ref[14:28]
     spread_steps_run = 0
     spread_error = None
     if args.task34_recover_spread_steps > 0:
@@ -1451,13 +1683,13 @@ def _auto_recover_task34_reference(
         video_recorder.set_overlay(_task_overlay_label(task_idx, retry=True))
     recover_info = _drive_state_ref_target(
         env,
-        task34_recover_state_ref.copy(),
+        recover_target_ref,
         max(args.recover_steps, 1),
         args.fixed_initial_state_tolerance,
         on_step=None if video_recorder is None else lambda: video_recorder.capture(env),
     )
     recover_error = float(recover_info["max_error"])
-    top_errors = _format_top_state_errors(_get_current_state_ref(env), task34_recover_state_ref)
+    top_errors = _format_top_state_errors(_get_current_state_ref(env), recover_target_ref)
     _flush_observations(env)
     print(
         f"[AUTO] Recovered task {task_idx + 1} to reference episode "
@@ -1475,16 +1707,444 @@ def _auto_recover_task34_reference(
     }
 
 
+def _run_direct_multistage_cosmos(
+    policy,
+    env,
+    task34_recover_state_ref: np.ndarray | None,
+    video_recorder: MultiViewVideoRecorder | None = None,
+    episode_idx: int = 0,
+) -> dict:
+    task_indices = _parse_index_list(args.auto_task_indices, "--auto_task_indices")
+    thresholds = _direct_task_thresholds(task_indices)
+    max_total_steps = (
+        args.cosmos_max_total_steps
+        if args.cosmos_max_total_steps > 0
+        else max(args.auto_total_steps_per_task, args.task_timeout_steps, 1) * len(task_indices)
+    )
+    decision_interval = max(args.cosmos_decision_interval_steps, 1)
+    context_frames = max(args.cosmos_context_frames, 1)
+    cosmos_manager = _make_cosmos_direct_manager()
+    snapshot_dir = Path(args.auto_video_dir) / "cosmos_snapshots" / f"episode_{episode_idx:06d}"
+    decision_log_path = _cosmos_decision_log_path()
+    frame_history: list[dict[str, str]] = []
+    decision_index = 0
+    steps_since_decision = 0
+    total_env_steps = 0
+    last_progress: float | None = None
+    cached_policy_actions: list[np.ndarray] = []
+    result = {
+        "success": False,
+        "success_source": None,
+        "tasks": [],
+        "total_policy_steps": 0,
+        "recover_count": 0,
+        "failed_task_idx": None,
+        "cosmos_mode": "direct_manager",
+    }
+    task_attempt_counts = {idx: 0 for idx in task_indices}
+    task_policy_step_counts = {idx: 0 for idx in task_indices}
+    task_start_state_refs: dict[int, np.ndarray] = {}
+
+    print(
+        "[COSMOS] Direct manager starting: "
+        f"tasks={[idx + 1 for idx in task_indices]}, decision_interval={decision_interval}, "
+        f"context_frames={context_frames}, max_total_steps={max_total_steps}, "
+        f"base_url={args.cosmos_base_url}, model={args.cosmos_model}."
+    )
+    if video_recorder is not None:
+        video_recorder.capture(env)
+
+    task_order_idx = 0
+    task_result: dict | None = None
+    while simulation_app.is_running():
+        if task_order_idx >= len(task_indices):
+            env_success = _env_task_success(env)
+            print(
+                f"[COSMOS] All configured tasks completed after {total_env_steps} policy env steps; "
+                f"env_task_success={env_success}, env_stage={_get_env_task_stage(env)}."
+            )
+            result["success"] = env_success
+            result["success_source"] = (
+                "cosmos_complete_completed_env_success" if env_success else "cosmos_complete_completed_env_failure"
+            )
+            result["failed_task_idx"] = None if env_success else task_indices[-1]
+            result["total_policy_steps"] = total_env_steps
+            return result
+        if total_env_steps >= max_total_steps:
+            task_idx = task_indices[task_order_idx]
+            if task_result is not None:
+                _finalize_direct_task_result(
+                    task_result,
+                    success=False,
+                    success_source="cosmos_max_total_steps",
+                    policy_steps=task_policy_step_counts[task_idx],
+                    final_progress=last_progress,
+                    env=env,
+                )
+                result["tasks"].append(task_result)
+            print(f"[COSMOS] Episode failed: reached max_total_steps={max_total_steps}.")
+            result["success_source"] = "cosmos_max_total_steps"
+            result["failed_task_idx"] = task_idx
+            result["total_policy_steps"] = total_env_steps
+            return result
+
+        task_idx = task_indices[task_order_idx]
+        task_start_state_refs.setdefault(task_idx, _get_current_state_ref(env).copy())
+        if task_result is None or task_result["task_idx"] != task_idx:
+            task_attempt_counts[task_idx] += 1
+            task_result = _new_direct_task_result(
+                task_idx=task_idx,
+                attempts=task_attempt_counts[task_idx],
+                policy_steps=task_policy_step_counts[task_idx],
+                threshold=thresholds.get(task_idx),
+                env=env,
+            )
+            cached_policy_actions = []
+            steps_since_decision = 0
+            overlay_text = _task_overlay_label(task_idx, retry=task_attempt_counts[task_idx] > 1)
+            if video_recorder is not None:
+                video_recorder.set_overlay(overlay_text)
+            print(
+                f"[COSMOS] Task {task_idx + 1} start: {TASK_DESCRIPTIONS[task_idx]}, "
+                f"attempt={task_attempt_counts[task_idx]}."
+            )
+
+        if steps_since_decision >= decision_interval:
+            camera_frames = _cosmos_camera_frames(env)
+            snapshot_paths = cosmos_manager.save_camera_snapshots(
+                camera_frames=camera_frames,
+                output_dir=snapshot_dir,
+                decision_index=decision_index,
+            )
+            frame_history.append(snapshot_paths)
+            frame_history = frame_history[-context_frames:]
+            with torch.inference_mode():
+                _, last_progress, policy_ms = _probe_task_progress(policy, env, task_idx)
+            context = _build_cosmos_context(
+                task_idx=task_idx,
+                last_progress=last_progress,
+                threshold_hint=thresholds.get(task_idx),
+                task_retry_count=int(task_result.get("recover_count", 0)),
+                task_elapsed_steps=task_policy_step_counts[task_idx],
+                timeout_steps=args.task_timeout_steps,
+                total_env_steps=total_env_steps,
+                progress_probe_ms=policy_ms,
+            )
+            retry_failure_threshold = float(args.cosmos_retry_failure_progress_threshold)
+            if (
+                retry_failure_threshold >= 0.0
+                and int(task_result.get("recover_count", 0)) >= 1
+                and last_progress is not None
+                and last_progress < retry_failure_threshold
+            ):
+                decision_payload = {
+                    "is_wrong": True,
+                    "decision": "fail_episode",
+                    "task_index": task_idx,
+                    "confidence": 1.0,
+                    "reason": (
+                        "Task failed and retry is not helpful: "
+                        f"complete_probability={last_progress:.6f} is below "
+                        f"post-retry failure threshold {retry_failure_threshold:.6f}."
+                    ),
+                    "source": "scheduler_guard",
+                }
+                _append_jsonl(
+                    decision_log_path,
+                    {
+                        "episode_idx": episode_idx,
+                        "decision_index": decision_index,
+                        "task_idx": task_idx,
+                        "total_env_steps": total_env_steps,
+                        "context": context,
+                        "cosmos": decision_payload,
+                    },
+                )
+                print(f"[COSMOS] Episode failed: {decision_payload['reason']}")
+                _finalize_direct_task_result(
+                    task_result,
+                    success=False,
+                    success_source="cosmos_retry_not_helpful",
+                    policy_steps=task_policy_step_counts[task_idx],
+                    final_progress=last_progress,
+                    env=env,
+                )
+                result["tasks"].append(task_result)
+                result["success_source"] = "cosmos_retry_not_helpful"
+                result["failed_task_idx"] = task_idx
+                result["total_policy_steps"] = total_env_steps
+                return result
+            try:
+                decision = cosmos_manager.decide(context=context, image_paths_by_frame=frame_history)
+                decision_payload = decision.to_log_dict()
+            except Exception as exc:
+                decision_payload = {"error": str(exc)}
+                _append_jsonl(
+                    decision_log_path,
+                    {
+                        "episode_idx": episode_idx,
+                        "decision_index": decision_index,
+                        "task_idx": task_idx,
+                        "total_env_steps": total_env_steps,
+                        "context": context,
+                        "cosmos": decision_payload,
+                    },
+                )
+                print(f"[COSMOS] Episode failed: Cosmos decision request failed: {exc}")
+                _finalize_direct_task_result(
+                    task_result,
+                    success=False,
+                    success_source="cosmos_error",
+                    policy_steps=task_policy_step_counts[task_idx],
+                    final_progress=last_progress,
+                    env=env,
+                )
+                result["tasks"].append(task_result)
+                result["success_source"] = "cosmos_error"
+                result["failed_task_idx"] = task_idx
+                result["total_policy_steps"] = total_env_steps
+                return result
+
+            threshold_hint = thresholds.get(task_idx)
+            is_final_task = task_order_idx == len(task_indices) - 1
+            if last_progress is not None:
+                decision = replace(decision, confidence=float(max(0.0, min(1.0, last_progress))))
+                decision_payload = decision.to_log_dict()
+                decision_payload["confidence_source"] = "complete_probability"
+            if decision.task_index is not None and decision.task_index != task_idx:
+                decision_payload["scheduler_warning"] = (
+                    f"Cosmos returned task_index={decision.task_index}, "
+                    f"but current_task_index={task_idx}; using current task."
+                )
+            if (
+                decision.decision == "complete"
+                and not is_final_task
+                and threshold_hint is not None
+                and last_progress is not None
+                and last_progress < threshold_hint
+            ):
+                original_payload = decision_payload
+                guarded_decision = "continue"
+                guard_reason = (
+                    f"Blocked Cosmos complete because complete_probability={last_progress:.6f} "
+                    f"is below threshold_hint={threshold_hint:.6f}; using {guarded_decision}."
+                )
+                decision = replace(
+                    decision,
+                    is_wrong=False,
+                    decision=guarded_decision,
+                    task_index=task_idx,
+                    confidence=float(max(0.0, min(1.0, last_progress))),
+                    reason=guard_reason,
+                )
+                decision_payload = decision.to_log_dict()
+                decision_payload["scheduler_guard"] = guard_reason
+                decision_payload["original_cosmos"] = original_payload
+
+            _append_jsonl(
+                decision_log_path,
+                {
+                    "episode_idx": episode_idx,
+                    "decision_index": decision_index,
+                    "task_idx": task_idx,
+                    "total_env_steps": total_env_steps,
+                    "context": context,
+                    "cosmos": decision_payload,
+                },
+            )
+            print(
+                f"[COSMOS] Decision {decision_index}: task={task_idx + 1}, "
+                f"is_wrong={decision.is_wrong}, decision={decision.decision}, "
+                f"confidence={decision.confidence:.2f}, reason={decision.reason}"
+            )
+            decision_index += 1
+            steps_since_decision = 0
+
+            if decision.decision == "complete":
+                if task_order_idx == len(task_indices) - 1:
+                    env_success = _env_task_success(env)
+                    success_source = "cosmos_complete_env_success" if env_success else "cosmos_complete_env_failure"
+                    print(
+                        f"[COSMOS] Final task complete requested; "
+                        f"env_task_success={env_success}, env_stage={_get_env_task_stage(env)}."
+                    )
+                    _finalize_direct_task_result(
+                        task_result,
+                        success=env_success,
+                        success_source=success_source,
+                        policy_steps=task_policy_step_counts[task_idx],
+                        final_progress=last_progress,
+                        env=env,
+                    )
+                    result["tasks"].append(task_result)
+                    result["success"] = env_success
+                    result["success_source"] = success_source
+                    result["failed_task_idx"] = None if env_success else task_idx
+                    result["total_policy_steps"] = total_env_steps
+                    return result
+                _finalize_direct_task_result(
+                    task_result,
+                    success=True,
+                    success_source="cosmos_complete",
+                    policy_steps=task_policy_step_counts[task_idx],
+                    final_progress=last_progress,
+                    env=env,
+                )
+                result["tasks"].append(task_result)
+                task_order_idx += 1
+                task_result = None
+                cached_policy_actions = []
+                continue
+            if decision.decision == "retry":
+                recover_info = _run_cosmos_recover(
+                    env=env,
+                    task_idx=task_idx,
+                    task_start_state_refs=task_start_state_refs,
+                    task34_recover_state_ref=task34_recover_state_ref,
+                    video_recorder=video_recorder,
+                )
+                task_result["recover_count"] += 1
+                result["recover_count"] += 1
+                cached_policy_actions = []
+                task_attempt_counts[task_idx] += 1
+                task_result["attempts"] = task_attempt_counts[task_idx]
+                print(f"[COSMOS] Ran retry: {recover_info}")
+                if _trocar_dropped(env):
+                    _finalize_direct_task_result(
+                        task_result,
+                        success=False,
+                        success_source="trocar_dropped",
+                        policy_steps=task_policy_step_counts[task_idx],
+                        final_progress=last_progress,
+                        env=env,
+                    )
+                    result["tasks"].append(task_result)
+                    result["success_source"] = "trocar_dropped"
+                    result["failed_task_idx"] = task_idx
+                    result["total_policy_steps"] = total_env_steps
+                    return result
+                continue
+
+        if not cached_policy_actions:
+            with torch.inference_mode():
+                action_dict, last_progress, policy_ms = _probe_task_progress(policy, env, task_idx)
+            action_chunk = _convert_policy_action_chunk_to_env(action_dict)
+            if not action_chunk:
+                raise RuntimeError("Policy returned an empty action chunk.")
+            cached_policy_actions = [a.copy() for a in action_chunk[: max(args.open_loop_steps, 1)]]
+            print(
+                f"[COSMOS] Task {task_idx + 1}: progress={last_progress} "
+                f"policy_ms={policy_ms:.0f}, task_steps={task_policy_step_counts[task_idx]}."
+            )
+
+        action_np = cached_policy_actions.pop(0)
+        action_tensor = _raw_action_to_env_tensor(action_np, device=env.device)
+        t0 = time.perf_counter()
+        _, _, terminated, truncated, _ = env.step(action_tensor)
+        env_step_ms = (time.perf_counter() - t0) * 1000.0
+        total_env_steps += 1
+        task_policy_step_counts[task_idx] += 1
+        steps_since_decision += 1
+        if video_recorder is not None:
+            video_recorder.capture(env, _task_overlay_label(task_idx, retry=task_attempt_counts[task_idx] > 1))
+
+        if _trocar_dropped(env):
+            print(f"[COSMOS] Episode failed: trocar dropped during task {task_idx + 1}.")
+            _finalize_direct_task_result(
+                task_result,
+                success=False,
+                success_source="trocar_dropped",
+                policy_steps=task_policy_step_counts[task_idx],
+                final_progress=last_progress,
+                env=env,
+            )
+            result["tasks"].append(task_result)
+            result["success_source"] = "trocar_dropped"
+            result["failed_task_idx"] = task_idx
+            result["total_policy_steps"] = total_env_steps
+            return result
+
+        if bool(terminated[0]) or bool(truncated[0]):
+            reason = "terminated" if bool(terminated[0]) else "truncated"
+            is_final_task = task_order_idx == len(task_indices) - 1
+            env_success = bool(terminated[0]) and is_final_task and _env_task_success(env)
+            success_source = (
+                "env_task_success"
+                if env_success
+                else "env_truncated"
+                if bool(truncated[0])
+                else "unexpected_env_terminated"
+            )
+            print(
+                f"[COSMOS] Episode finished by env-native {reason} during task {task_idx + 1} "
+                f"after env_step_ms={env_step_ms:.0f}; "
+                f"is_final_task={is_final_task}, env_task_success={_env_task_success(env)}, "
+                f"env_stage={_get_env_task_stage(env)}."
+            )
+            _finalize_direct_task_result(
+                task_result,
+                success=env_success,
+                success_source=success_source,
+                policy_steps=task_policy_step_counts[task_idx],
+                final_progress=last_progress,
+                env=env,
+            )
+            result["tasks"].append(task_result)
+            result["success"] = env_success
+            result["success_source"] = success_source
+            result["failed_task_idx"] = None if env_success else task_idx
+            result["total_policy_steps"] = total_env_steps
+            return result
+
+    task_idx = task_indices[min(task_order_idx, len(task_indices) - 1)]
+    if task_result is not None:
+        _finalize_direct_task_result(
+            task_result,
+            success=False,
+            success_source="simulation_stopped",
+            policy_steps=task_policy_step_counts[task_idx],
+            final_progress=last_progress,
+            env=env,
+        )
+        result["tasks"].append(task_result)
+    result["success_source"] = "simulation_stopped"
+    result["failed_task_idx"] = task_idx
+    result["total_policy_steps"] = total_env_steps
+    return result
+
+
 def _run_direct_multistage(
     policy,
     env,
     task34_recover_state_ref: np.ndarray | None,
     video_recorder: MultiViewVideoRecorder | None = None,
+    episode_idx: int = 0,
 ) -> dict:
+    if args.cosmos_reasoning_mode == "direct_manager":
+        return _run_direct_multistage_cosmos(
+            policy,
+            env,
+            task34_recover_state_ref,
+            video_recorder=video_recorder,
+            episode_idx=episode_idx,
+        )
+
     task_indices = _parse_index_list(args.auto_task_indices, "--auto_task_indices")
     single_attempt_task_indices = _parse_optional_index_set(
         args.auto_single_attempt_task_indices,
         "--auto_single_attempt_task_indices",
+    )
+    timeout_advance_task_indices = _parse_optional_index_set(
+        args.auto_timeout_advance_task_indices,
+        "--auto_timeout_advance_task_indices",
+    )
+    timeout_then_threshold_task_indices = _parse_optional_index_set(
+        args.auto_timeout_then_threshold_task_indices,
+        "--auto_timeout_then_threshold_task_indices",
+    )
+    timeout_then_env_success_task_indices = _parse_optional_index_set(
+        args.auto_timeout_then_env_success_task_indices,
+        "--auto_timeout_then_env_success_task_indices",
     )
     hold_height_task_indices = _parse_optional_index_set(
         args.auto_hold_height_task_indices,
@@ -1495,6 +2155,7 @@ def _run_direct_multistage(
     attempt_step_limit = max(args.task_timeout_steps, 1)
     total_step_limit = max(args.auto_total_steps_per_task, attempt_step_limit)
     max_attempts = max(1, (total_step_limit + attempt_step_limit - 1) // attempt_step_limit)
+    timeout_advance_early_stop_threshold = float(args.auto_timeout_advance_early_stop_threshold)
     total_env_steps = 0
     result = {
         "success": False,
@@ -1512,20 +2173,32 @@ def _run_direct_multistage(
         "[AUTO] Direct multi-stage inference starting: "
         f"tasks={[idx + 1 for idx in task_indices]}, "
         f"thresholds={[thresholds[idx] for idx in task_indices]}, "
+        f"timeout_advance_tasks={[idx + 1 for idx in sorted(timeout_advance_task_indices)]}, "
+        f"timeout_then_threshold_tasks={[idx + 1 for idx in sorted(timeout_then_threshold_task_indices)]}, "
+        f"timeout_then_env_success_tasks={[idx + 1 for idx in sorted(timeout_then_env_success_task_indices)]}, "
+        f"timeout_advance_early_stop_threshold={timeout_advance_early_stop_threshold}, "
         f"attempt_steps={attempt_step_limit}, total_steps_per_task={total_step_limit}, "
         f"max_attempts={max_attempts}."
     )
     if video_recorder is not None:
-        video_recorder.capture(env, "Episode start")
+        video_recorder.capture(env)
 
     task_order_idx = 0
     while task_order_idx < len(task_indices):
         task_idx = task_indices[task_order_idx]
         threshold = thresholds[task_idx]
+        uses_timeout_advance = task_idx in timeout_advance_task_indices
+        uses_timeout_then_threshold = task_idx in timeout_then_threshold_task_indices
+        uses_timeout_then_env_success = task_idx in timeout_then_env_success_task_indices
         is_final_task = task_order_idx == len(task_indices) - 1
         task_max_attempts = (
             1
-            if task_idx in single_attempt_task_indices or (args.auto_no_retry_last_task and is_final_task)
+            if (
+                task_idx in single_attempt_task_indices
+                or uses_timeout_advance
+                or uses_timeout_then_env_success
+                or (args.auto_no_retry_last_task and is_final_task)
+            )
             else max_attempts
         )
         task_total_step_limit = attempt_step_limit if task_max_attempts == 1 else total_step_limit
@@ -1542,9 +2215,18 @@ def _run_direct_multistage(
             "final_progress": None,
             "env_stage": _get_env_task_stage(env),
         }
+        task_advance_rule = (
+            f"timeout={attempt_step_limit} steps"
+            if uses_timeout_advance
+            else f"timeout={attempt_step_limit} steps then env task_success"
+            if uses_timeout_then_env_success
+            else f"timeout={attempt_step_limit} steps then threshold={threshold:.4f}"
+            if uses_timeout_then_threshold
+            else f"threshold={threshold:.4f}"
+        )
         print(
             f"[AUTO] Task {task_idx + 1} start: {TASK_DESCRIPTIONS[task_idx]}, "
-            f"threshold={threshold:.4f}, max_attempts={task_max_attempts}"
+            f"{task_advance_rule}, max_attempts={task_max_attempts}"
             + (" (final success uses env-native task_success)." if is_final_task else ".")
         )
 
@@ -1574,11 +2256,31 @@ def _run_direct_multistage(
                 if not cached_policy_actions:
                     with torch.inference_mode():
                         action_dict, last_progress, policy_ms = _probe_task_progress(policy, env, task_idx)
-                    if not is_final_task and last_progress is not None and last_progress >= threshold:
+                    if (
+                        not is_final_task
+                        and not uses_timeout_advance
+                        and not uses_timeout_then_env_success
+                        and not uses_timeout_then_threshold
+                        and last_progress is not None
+                        and last_progress >= threshold
+                    ):
                         task_success = True
                         print(
                             f"[AUTO] Task {task_idx + 1} reached threshold before step: "
                             f"progress={last_progress:.4f} >= {threshold:.4f}."
+                        )
+                        task_result["final_progress"] = last_progress
+                        break
+                    if (
+                        uses_timeout_advance
+                        and timeout_advance_early_stop_threshold >= 0.0
+                        and last_progress is not None
+                        and last_progress >= timeout_advance_early_stop_threshold
+                    ):
+                        task_success = True
+                        print(
+                            f"[AUTO] Task {task_idx + 1} reached timeout-advance early stop before step: "
+                            f"progress={last_progress:.6f} >= {timeout_advance_early_stop_threshold:.6f}."
                         )
                         task_result["final_progress"] = last_progress
                         break
@@ -1633,6 +2335,25 @@ def _run_direct_multistage(
                     result["total_policy_steps"] = total_env_steps
                     return result
 
+                if _env_task_success(env):
+                    print(
+                        f"[AUTO] Episode succeeded by env task_success during task {task_idx + 1} "
+                        f"attempt {attempt_idx} after env_step_ms={env_step_ms:.0f}; "
+                        f"env_stage={_get_env_task_stage(env)}."
+                    )
+                    task_success = True
+                    task_result["success"] = True
+                    task_result["success_source"] = "env_task_success_early"
+                    task_result["policy_steps"] = task_policy_step_counts[task_idx]
+                    task_result["final_progress"] = last_progress
+                    task_result["env_stage"] = _get_env_task_stage(env)
+                    result["tasks"].append(task_result)
+                    result["success"] = True
+                    result["success_source"] = "env_task_success_early"
+                    result["failed_task_idx"] = None
+                    result["total_policy_steps"] = total_env_steps
+                    return result
+
                 if bool(terminated[0]) or bool(truncated[0]):
                     reason = "terminated" if bool(terminated[0]) else "truncated"
                     print(
@@ -1654,9 +2375,34 @@ def _run_direct_multistage(
             if task_success:
                 break
 
+            if uses_timeout_advance and attempt_steps >= attempt_step_limit:
+                task_success = True
+                task_result["final_progress"] = last_progress
+                print(
+                    f"[AUTO] Task {task_idx + 1} reached timeout advance after "
+                    f"{attempt_steps}/{attempt_step_limit} steps."
+                )
+                break
+
+            if uses_timeout_then_env_success and attempt_steps >= attempt_step_limit:
+                task_success = _env_task_success(env)
+                task_result["final_progress"] = last_progress
+                print(
+                    f"[AUTO] Task {task_idx + 1} reached timeout after "
+                    f"{attempt_steps}/{attempt_step_limit} steps; "
+                    f"env_task_success={task_success}, env_stage={_get_env_task_stage(env)}."
+                )
+                break
+
             with torch.inference_mode():
                 _, last_progress, policy_ms = _probe_task_progress(policy, env, task_idx)
-            if not is_final_task and last_progress is not None and last_progress >= threshold:
+            if (
+                not is_final_task
+                and not uses_timeout_advance
+                and not uses_timeout_then_env_success
+                and last_progress is not None
+                and last_progress >= threshold
+            ):
                 task_success = True
                 print(
                     f"[AUTO] Task {task_idx + 1} reached threshold after attempt {attempt_idx}: "
@@ -1699,14 +2445,29 @@ def _run_direct_multistage(
                 task_idx == 3
                 and task_policy_step_counts[task_idx] < task_total_step_limit
                 and attempt_idx < task_max_attempts
-                and 2 in task_start_state_refs
+                and (task34_recover_state_ref is not None or 2 in task_start_state_refs)
             ):
-                print("[AUTO] Task 4 attempt failed; returning robot to task 3 start and rerunning task 3.")
+                rollback_state_ref = (
+                    task34_recover_state_ref.copy()
+                    if task34_recover_state_ref is not None
+                    else task_start_state_refs[2].copy()
+                )
+                rollback_state_ref[14:28] = _get_current_state_ref(env)[14:28]
+                rollback_source = (
+                    f"fixed dataset reference episode {args.task34_recover_reference_episode} "
+                    f"frame {args.task34_recover_reference_frame}"
+                    if task34_recover_state_ref is not None
+                    else "current episode task 3 start"
+                )
+                print(
+                    "[AUTO] Task 4 attempt failed; returning robot to task 3 start "
+                    f"from {rollback_source} and rerunning task 3."
+                )
                 if video_recorder is not None:
                     video_recorder.set_overlay(_task_overlay_label(3, retry=True))
                 _drive_state_ref_target(
                     env,
-                    task_start_state_refs[2],
+                    rollback_state_ref,
                     max(args.recover_steps, 1),
                     args.fixed_initial_state_tolerance,
                     on_step=None if video_recorder is None else lambda: video_recorder.capture(env),
@@ -1741,10 +2502,16 @@ def _run_direct_multistage(
         if not task_success:
             if task_idx == 3 and task_order_idx == task_indices.index(2):
                 continue
-            print(
-                f"[AUTO] Task {task_idx + 1} failed to reach threshold {threshold:.4f} "
-                f"within {task_policy_step_counts[task_idx]}/{task_total_step_limit} policy steps."
-            )
+            if uses_timeout_advance:
+                print(
+                    f"[AUTO] Task {task_idx + 1} failed before timeout advance "
+                    f"within {task_policy_step_counts[task_idx]}/{task_total_step_limit} policy steps."
+                )
+            else:
+                print(
+                    f"[AUTO] Task {task_idx + 1} failed to reach threshold {threshold:.4f} "
+                    f"within {task_policy_step_counts[task_idx]}/{task_total_step_limit} policy steps."
+                )
             result["failed_task_idx"] = task_idx
             result["total_policy_steps"] = total_env_steps
             return result
@@ -1792,7 +2559,13 @@ def _run_direct_multistage_episodes(
             video_recorder = MultiViewVideoRecorder(video_dir, args.auto_video_fps)
 
         try:
-            episode_result = _run_direct_multistage(policy, env, task34_recover_state_ref, video_recorder)
+            episode_result = _run_direct_multistage(
+                policy,
+                env,
+                task34_recover_state_ref,
+                video_recorder,
+                episode_idx=episode_idx,
+            )
             episode_result["episode_idx"] = episode_idx
             episode_result["tray_yaw_deg"] = tray_yaw_deg
             episode_results.append(episode_result)
