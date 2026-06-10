@@ -118,7 +118,7 @@ class AssembleTrocarSceneCfg(InteractiveSceneCfg):
     trocar_1 = RigidObjectCfg(
         prim_path="/World/envs/env_.*/trocar_1",
         spawn=UsdFileCfg(
-            usd_path="/localhome/local-vennw/code/Trocar004_test.usd",
+            usd_path="/localhome/local-vennw/code/sim2real_rlinf_dev_pg/assets/assemble_trocar/Assets/Trocar002/Trocar004_test_nodeform.usd",
             collision_props=sim_utils.CollisionPropertiesCfg(
                 collision_enabled=True,
                 contact_offset=0.001,
@@ -242,7 +242,7 @@ class TerminationsCfg:
         time_out=False,  # This is a success termination, not a failure
         params={
             "print_log": False,
-            "success_stage": 3,
+            "success_stage": 4,
         },
     )
     object_drop = DoneTerm(
@@ -437,3 +437,112 @@ class G1AssembleTrocarEvalEnvCfg(G1AssembleTrocarEnvCfg):
 
     # Override events to enforce deterministic per-env tray yaw on every reset.
     events: EventCfgFixTrayRotation = EventCfgFixTrayRotation()
+
+
+# ---------------------------------------------------------------------------
+# Scene variants — used by both record_trocar_episodes.py and play.py
+# ---------------------------------------------------------------------------
+# Local asset roots — same files as the Nucleus paths used by record_trocar_episodes.py
+# but copied to disk so play.py / RLinf workers don't depend on Omniverse connectivity.
+_BENCHMARK_ASSETS = "/localhome/local-vennw/code/IsaacLab/benchmark_assets"
+_SCENE1MX2 = f"{_BENCHMARK_ASSETS}/scenes/Scene1MX2"
+
+
+def _shared_prop_assets() -> tuple[AssetBaseCfg, AssetBaseCfg]:
+    """Cart and instrument trolley placed in all non-lightwheel scenes."""
+    cart_cfg = AssetBaseCfg(
+        prim_path="/World/envs/env_.*/cart001",
+        spawn=UsdFileCfg(usd_path=f"{_BENCHMARK_ASSETS}/Cart001.usd"),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(-1.48242, 2.03195, 0.00279), rot=(0.0, 0.0, 0.0, 1.0)),
+    )
+    trolley_cfg = AssetBaseCfg(
+        prim_path="/World/envs/env_.*/instrument_trolley002",
+        spawn=UsdFileCfg(
+            usd_path=f"{_BENCHMARK_ASSETS}/InstrumentTrolley002.usd",
+            scale=(1.05, 1.05, 1.05),
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(-1.52131, 1.4862, 0.0), rot=(0.0, 0.0, 1.0, 0.0)),
+    )
+    return cart_cfg, trolley_cfg
+
+
+def apply_scene_variant(env_cfg, variant: str) -> None:
+    """Patch env_cfg.scene in-place to swap the background scene.
+
+    Keeps record_trocar_episodes.py and play.py in sync: both can apply the same
+    variant by calling this helper (record script at runtime; play.py via the
+    pre-baked subclasses below).
+    """
+    if variant == "lightwheel":
+        return  # default scene03.usd is already configured
+    env_cfg.scene.env_spacing = 50.0
+    cart_cfg, trolley_cfg = _shared_prop_assets()
+
+    if variant == "orca":
+        env_cfg.scene.scene = AssetBaseCfg(
+            prim_path="/World/envs/env_.*/Scene",
+            spawn=UsdFileCfg(usd_path=f"{_SCENE1MX2}/main_new_light.usd"),
+            init_state=AssetBaseCfg.InitialStateCfg(pos=(4.0, -5.5, 0.0), rot=(0.0, 0.0, 0.0, 1.0)),
+        )
+        env_cfg.scene.light = None
+    elif variant == "factory":
+        env_cfg.scene.scene = AssetBaseCfg(
+            prim_path="/World/envs/env_.*/Scene",
+            spawn=UsdFileCfg(usd_path=f"{_SCENE1MX2}/rlinf_scenes/factory.usd"),
+            init_state=AssetBaseCfg.InitialStateCfg(pos=(1.0, 3.0, 0.0), rot=(0.0, 0.0, 1.0, 0.0)),
+        )
+        env_cfg.scene.light = None
+    elif variant == "surgical_room":
+        env_cfg.scene.scene = AssetBaseCfg(
+            prim_path="/World/envs/env_.*/Scene",
+            spawn=UsdFileCfg(
+                usd_path=f"{_SCENE1MX2}/push-cart-OR-scenes/main.usd",
+                scale=(0.008, 0.008, 0.008),
+            ),
+            init_state=AssetBaseCfg.InitialStateCfg(
+                pos=(-3.8, 5.3, 0.0), rot=(0.0, 0.0, -0.70710678, 0.70710678)
+            ),
+        )
+        env_cfg.scene.light = AssetBaseCfg(
+            prim_path="/World/light",
+            spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=1000.0),
+            init_state=AssetBaseCfg.InitialStateCfg(pos=(-3.8, 5.3, 2.0), rot=(0.0, 0.0, 0.0, 1.0)),
+        )
+    else:
+        raise ValueError(f"Unknown scene variant: {variant!r}")
+
+    setattr(env_cfg.scene, "cart001", cart_cfg)
+    setattr(env_cfg.scene, "instrument_trolley002", trolley_cfg)
+
+
+@configclass
+class G1AssembleTrocarFactoryEnvCfg(G1AssembleTrocarEnvCfg):
+    """Same env as base, but the background scene is swapped to factory.usd."""
+
+    def __post_init__(self):
+        parent_post_init = getattr(super(), "__post_init__", None)
+        if callable(parent_post_init):
+            parent_post_init()
+        apply_scene_variant(self, "factory")
+
+
+@configclass
+class G1AssembleTrocarOrcaEnvCfg(G1AssembleTrocarEnvCfg):
+    """Same env as base, but the background scene is swapped to the Orca scene."""
+
+    def __post_init__(self):
+        parent_post_init = getattr(super(), "__post_init__", None)
+        if callable(parent_post_init):
+            parent_post_init()
+        apply_scene_variant(self, "orca")
+
+
+@configclass
+class G1AssembleTrocarSurgicalRoomEnvCfg(G1AssembleTrocarEnvCfg):
+    """Same env as base, but the background scene is swapped to a surgical room."""
+
+    def __post_init__(self):
+        parent_post_init = getattr(super(), "__post_init__", None)
+        if callable(parent_post_init):
+            parent_post_init()
+        apply_scene_variant(self, "surgical_room")

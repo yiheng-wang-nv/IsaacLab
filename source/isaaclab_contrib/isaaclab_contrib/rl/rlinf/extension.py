@@ -452,6 +452,14 @@ def _register_isaaclab_envs() -> None:
         if tid and tid not in task_ids:
             task_ids.append(tid)
 
+    # Also auto-register scene-variant task IDs for cross-environment evaluation,
+    # so play.py --task <variant-id> works without requiring YAML changes.
+    base_task = "Isaac-Assemble-Trocar-G129-Dex3-RLinf"
+    for variant in ("v0", "Eval-v0", "Factory-v0", "Orca-v0", "SurgicalRoom-v0"):
+        tid = f"{base_task}-{variant}"
+        if tid not in task_ids:
+            task_ids.append(tid)
+
     if not task_ids:
         logger.warning("No task IDs found in YAML config (env.*.init_params.id)")
         return

@@ -1,0 +1,99 @@
+# RLinf stage 4 best (global_step_166) benchmark on all 4 scenes
+# Run each in a separate tmux session / terminal so the 4 GPUs run in parallel.
+#
+# usage: ./benchmark_new_scene.sh [scene] [policy_type] [model_path] [gpu_id] [chunk] [init_pose]
+#   init_pose: dataset (default, episode 0 frame 0 pose) | rlinf (env default reset pose, matches RL training)
+
+RLINF_CKPT=/localhome/local-vennw/code/IsaacLab/scripts/reinforcement_learning/rlinf/logs/rlinf/20260508-02:26:41-Isaac-Assemble-Trocar-G129-Dex3-RLinf-v0/test_gr00t/checkpoints/global_step_166/actor/model_state_dict
+
+
+# Scene 1: lightwheel (original)  -- GPU 4
+./benchmark_new_scene.sh lightwheel rlinf $RLINF_CKPT 4
+
+
+# Scene 2: factory  -- GPU 5
+./benchmark_new_scene.sh factory rlinf $RLINF_CKPT 5
+
+
+# Scene 3: orca  -- GPU 6
+./benchmark_new_scene.sh orca rlinf $RLINF_CKPT 6
+
+
+# Scene 4: surgical_room  -- GPU 7
+./benchmark_new_scene.sh surgical_room rlinf $RLINF_CKPT 7 1
+
+
+# ============================================================
+# Original (baseline) RLinf weights used to collect the success demonstration data
+# ============================================================
+# These are the weights downloaded from HF (nvidia/orca_rlinf_weights), the "starting point"
+# before our new GR00T base model + RLinf post-training. Use as a reference baseline.
+
+BASELINE_CKPT=/localhome/local-vennw/models/orca_rlinf_weights/rlinf/actor/model_state_dict
+
+# Scene: lightwheel (original)  -- GPU 2
+./benchmark_new_scene.sh lightwheel rlinf $BASELINE_CKPT 2
+
+# Scene: factory  -- GPU 1
+./benchmark_new_scene.sh factory rlinf $BASELINE_CKPT 7 1
+
+# Scene: orca  -- GPU 0
+./benchmark_new_scene.sh orca rlinf $BASELINE_CKPT 4
+
+# Scene: surgical_room  -- GPU 3
+./benchmark_new_scene.sh surgical_room rlinf $BASELINE_CKPT 3
+
+
+# ============================================================
+# Same benchmarks but starting from the RLinf-training default reset pose
+# (no fixed_initial_state_dataset warm-start). Output dirs get _rlinfpose suffix.
+# ============================================================
+
+# --- Our stage 4 best (global_step_166) ---
+# lightwheel  -- GPU 4
+./benchmark_new_scene.sh lightwheel rlinf $RLINF_CKPT 4 1 rlinf
+
+# factory  -- GPU 5
+./benchmark_new_scene.sh factory rlinf $RLINF_CKPT 5 1 rlinf
+
+# orca  -- GPU 6
+./benchmark_new_scene.sh orca rlinf $RLINF_CKPT 6 1 rlinf
+
+# surgical_room  -- GPU 7
+./benchmark_new_scene.sh surgical_room rlinf $RLINF_CKPT 7 1 rlinf
+
+
+# --- Baseline (orca_rlinf_weights from HF) ---
+# lightwheel  -- GPU 0
+./benchmark_new_scene.sh lightwheel rlinf $BASELINE_CKPT 0 1 rlinf
+
+# factory  -- GPU 1
+./benchmark_new_scene.sh factory rlinf $BASELINE_CKPT 1 1 rlinf
+
+# orca  -- GPU 2
+./benchmark_new_scene.sh orca rlinf $BASELINE_CKPT 2 1 rlinf
+
+# surgical_room  -- GPU 3
+./benchmark_new_scene.sh surgical_room rlinf $BASELINE_CKPT 3 1 rlinf
+
+
+# ============================================================
+# play.py — RLinf-native parallel eval (32 envs × 4 rollout epochs = 128 episodes)
+# Uses all 8 GPUs (FSDP). Run sequentially — one command at a time.
+# Saves videos under scripts/reinforcement_learning/rlinf/logs/rlinf/eval/<timestamp>-<task>/
+# ============================================================
+PLAY=python\ /localhome/local-vennw/code/IsaacLab/scripts/reinforcement_learning/rlinf/play.py
+CFG=--config_path\ /localhome/local-vennw/code/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/assemble_trocar/config\ --config_name\ isaaclab_ppo_gr00t_assemble_trocar
+EVAL_ARGS=--num_envs\ 32\ --num_episodes\ 32\ --video
+GR00T_CKPT=/localhome/local-vennw/code/cosmos_gr00t/Isaac-GR00T/sft_4gpu_256bs_50ksteps_success_lt7/checkpoint-50000
+BASELINE_CKPT=/localhome/local-vennw/models/orca_rlinf_weights/rlinf/actor/model_state_dict
+RLINF_CKPT=/localhome/local-vennw/code/IsaacLab/scripts/reinforcement_learning/rlinf/logs/rlinf/20260508-02:26:41-Isaac-Assemble-Trocar-G129-Dex3-RLinf-v0/test_gr00t/checkpoints/global_step_166/actor/model_state_dict
+
+# --- Our RLinf (stage 4 best, global_step_166) ---
+$PLAY $CFG --task Isaac-Assemble-Trocar-G129-Dex3-RLinf-v0              --model_path $RLINF_CKPT $EVAL_ARGS
+
+# --- Original baseline RLinf (orca_rlinf_weights from HF) ---
+$PLAY $CFG --task Isaac-Assemble-Trocar-G129-Dex3-RLinf-v0              --model_path $BASELINE_CKPT $EVAL_ARGS
+
+# --- Our GR00T SFT base model (value head warning is harmless) ---
+$PLAY $CFG --task Isaac-Assemble-Trocar-G129-Dex3-RLinf-v0              --model_path $GR00T_CKPT $EVAL_ARGS

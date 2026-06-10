@@ -31,6 +31,13 @@ parser.add_argument(
     help="Number of action chunk steps to execute before running GR00T inference again."
     " Defaults to 8 for --use_gr00t_policy and 1 for RLinf checkpoints.",
 )
+parser.add_argument(
+    "--rlinf_base_config_path",
+    type=str,
+    default="/localhome/local-vennw/code/cosmos_gr00t/Isaac-GR00T/sft_4gpu_256bs_50ksteps_success_lt7/checkpoint-50000",
+    help="When the RLinf checkpoint contains only full_weights.pt (no config.json), "
+    "load model architecture from this base SFT checkpoint and then load RLinf weights on top.",
+)
 parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel envs for recording.")
 parser.add_argument("--model_device", type=str, default="cuda:0", help="Device for model inference.")
 parser.add_argument("--seed", type=int, default=None, help="Random seed for env reproducibility.")
@@ -1234,8 +1241,22 @@ def main():
             "use_vlm_value": False, "value_vlm_mode": "mean_token", "padding_value": 850,
         })
 
+        # Detect bare RLinf checkpoint: dir has full_weights.pt but no config.json.
+        bare_rlinf_ckpt = (
+            os.path.isfile(os.path.join(args.model_path, "full_weights.pt"))
+            and not os.path.isfile(os.path.join(args.model_path, "config.json"))
+        )
+        if bare_rlinf_ckpt:
+            print(
+                f"[INFO] Bare RLinf checkpoint detected (only full_weights.pt). "
+                f"Building model architecture from {args.rlinf_base_config_path}, then loading RLinf weights."
+            )
+            config_source = args.rlinf_base_config_path
+        else:
+            config_source = args.model_path
+
         policy = GR00T_N1_5_ForRLActionPrediction.from_pretrained(
-            args.model_path,
+            config_source,
             torch_dtype=torch.bfloat16,
             embodiment_tag="new_embodiment",
             modality_config=modality_config,
@@ -1247,6 +1268,16 @@ def main():
             tune_llm=False,
             rl_head_config=rl_head_config,
         )
+
+        if bare_rlinf_ckpt:
+            weights_path = os.path.join(args.model_path, "full_weights.pt")
+            state_dict = torch.load(weights_path, map_location="cpu")
+            missing, unexpected = policy.load_state_dict(state_dict, strict=False)
+            print(
+                f"[INFO] Loaded RLinf weights from {weights_path}: "
+                f"missing={len(missing)}, unexpected={len(unexpected)}"
+            )
+
         policy.to(torch.bfloat16)
         policy.eval()
         policy.to(args.model_device)

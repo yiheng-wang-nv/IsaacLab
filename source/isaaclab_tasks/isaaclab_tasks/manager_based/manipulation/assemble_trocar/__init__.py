@@ -42,3 +42,23 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# Scene variants for cross-environment generalization eval.
+gym.register(
+    id="Isaac-Assemble-Trocar-G129-Dex3-RLinf-Factory-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={"env_cfg_entry_point": g129_dex3_env_cfg.G1AssembleTrocarFactoryEnvCfg},
+    disable_env_checker=True,
+)
+gym.register(
+    id="Isaac-Assemble-Trocar-G129-Dex3-RLinf-Orca-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={"env_cfg_entry_point": g129_dex3_env_cfg.G1AssembleTrocarOrcaEnvCfg},
+    disable_env_checker=True,
+)
+gym.register(
+    id="Isaac-Assemble-Trocar-G129-Dex3-RLinf-SurgicalRoom-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={"env_cfg_entry_point": g129_dex3_env_cfg.G1AssembleTrocarSurgicalRoomEnvCfg},
+    disable_env_checker=True,
+)
