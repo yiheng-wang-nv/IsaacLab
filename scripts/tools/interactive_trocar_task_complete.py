@@ -89,6 +89,14 @@ parser.add_argument(
     help="Run tasks automatically without keyboard/GUI control, advancing only when progress reaches threshold.",
 )
 parser.add_argument(
+    "--interactive_multistage_continue",
+    action="store_true",
+    help=(
+        "In interactive GUI mode, advance tasks using the direct-mode timeout rules and pause after "
+        "timeout-then-threshold tasks so the operator can recover or continue."
+    ),
+)
+parser.add_argument(
     "--auto_task_indices",
     type=str,
     default="0,1,2,3,4",
@@ -591,8 +599,7 @@ def _print_controls() -> None:
     print("Interactive trocar task-complete controls:")
     print("  1-5   : select stage task prompt")
     print("  SPACE / P : toggle continuous inference")
-    print("  S : run one policy step")
-    print("  G : probe task_complete prediction without stepping")
+    print("  C : continue after a staged pause")
     print("  T : recover robot toward the current task-start state")
     print("  O : rotate the tray by the configured yaw delta")
     print("  B : rotate the tray back to its reset yaw")
@@ -1415,6 +1422,7 @@ class KeyboardInterface:
         self.pending_reset = False
         self.pending_recover = False
         self.pending_recover_task_idx: int | None = None
+        self.pending_continue = False
         self.pending_tray_rotation = False
         self.pending_tray_return = False
         self.selected_task_idx = initial_task_idx
@@ -1458,6 +1466,11 @@ class KeyboardInterface:
         self.pending_recover_task_idx = None
         return v, task_idx
 
+    def consume_continue(self) -> bool:
+        v = self.pending_continue
+        self.pending_continue = False
+        return v
+
     def consume_tray_rotation(self) -> bool:
         v = self.pending_tray_rotation
         self.pending_tray_rotation = False
@@ -1483,15 +1496,23 @@ class KeyboardInterface:
         self.pending_recover_task_idx = task_idx
         self.pending_single_step = False
         self.pending_task_complete_probe = False
+        self.pending_continue = False
         if task_idx is None:
             self.last_message = "Queued current task recover."
         else:
             self.last_message = f"Queued task {task_idx + 1} recover."
 
+    def queue_continue(self) -> None:
+        self.pending_continue = True
+        self.pending_single_step = False
+        self.pending_task_complete_probe = False
+        self.last_message = "Queued continue."
+
     def queue_reset(self) -> None:
         self.running = False
         self.pending_single_step = False
         self.pending_task_complete_probe = False
+        self.pending_continue = False
         self.pending_tray_rotation = False
         self.pending_tray_return = False
         self.pending_recover = False
@@ -1532,6 +1553,8 @@ class KeyboardInterface:
         elif aliases & {"G"}:
             self.pending_task_complete_probe = True
             self.last_message = "Queued a task_complete probe without env step."
+        elif aliases & {"C"}:
+            self.queue_continue()
         elif aliases & {"T"}:
             self.queue_recover()
         elif aliases & {"O"}:
@@ -1575,12 +1598,11 @@ class StatusPanel:
                 ui.Label("Controls:", word_wrap=True)
                 with ui.HStack(spacing=4):
                     ui.Button("Start/Pause", width=0, clicked_fn=keyboard.toggle_running)
-                    ui.Button("Step", width=0, clicked_fn=lambda: setattr(keyboard, "pending_single_step", True))
                     ui.Button(
-                        "Probe TC",
+                        "Continue",
                         width=0,
-                        clicked_fn=lambda: setattr(keyboard, "pending_task_complete_probe", True),
-                        tooltip="Probe task_complete without stepping (G key)",
+                        clicked_fn=keyboard.queue_continue,
+                        tooltip="Continue to the next stage after a staged pause (C key).",
                     )
                     ui.Button(
                         "Recover",
@@ -1603,7 +1625,7 @@ class StatusPanel:
                     )
                 ui.Spacer(height=4)
                 ui.Label(
-                    "Keys: 1-5 select task  SPACE/P start|pause  S step  G probe TC  T recover current  O rotate  B back  R reset",
+                    "Keys: 1-5 select task  SPACE/P start|pause  C continue  T recover current  O rotate  B back  R reset",
                     word_wrap=True,
                 )
 
@@ -1638,12 +1660,35 @@ class StatusPanel:
         policy_ms = "n/a" if last_policy_ms is None else f"{last_policy_ms:.0f}"
         env_ms = "n/a" if last_env_step_ms is None else f"{last_env_step_ms:.0f}"
         task_desc = TASK_DESCRIPTIONS[keyboard.selected_task_idx]
+        if args.interactive_multistage_continue:
+            timeout_advance_task_indices = _parse_optional_index_set(
+                args.auto_timeout_advance_task_indices,
+                "--auto_timeout_advance_task_indices",
+            )
+            timeout_then_threshold_task_indices = _parse_optional_index_set(
+                args.auto_timeout_then_threshold_task_indices,
+                "--auto_timeout_then_threshold_task_indices",
+            )
+            timeout_then_env_success_task_indices = _parse_optional_index_set(
+                args.auto_timeout_then_env_success_task_indices,
+                "--auto_timeout_then_env_success_task_indices",
+            )
+            if keyboard.selected_task_idx in timeout_advance_task_indices:
+                advance_rule = f"timeout {args.task_timeout_steps} steps -> next task"
+            elif keyboard.selected_task_idx in timeout_then_threshold_task_indices:
+                advance_rule = f"timeout {args.task_timeout_steps} steps, then TC >= {tc_threshold:.4f}"
+            elif keyboard.selected_task_idx in timeout_then_env_success_task_indices:
+                advance_rule = f"timeout {args.task_timeout_steps} steps, then env success"
+            else:
+                advance_rule = f"timeout {args.task_timeout_steps} steps -> pause"
+        else:
+            advance_rule = f"TC >= {tc_threshold:.4f}" if keyboard.stop_on_task_complete else "manual"
 
         self._status.text = (
             f"Mode: {mode}\n"
             f"Task {keyboard.selected_task_idx + 1}: {task_desc}\n"
-            f"task_complete: {tc_text}  (>= {tc_threshold:.2f}: {tc_above})\n"
-            f"Auto-stop on TC: {keyboard.stop_on_task_complete}\n"
+            f"task_complete: {tc_text}  (>= {tc_threshold:.4f}: {tc_above})\n"
+            f"Advance rule: {advance_rule}\n"
             f"Task run steps: {task_run_step_count} / {args.task_timeout_steps}\n"
             f"Open-loop steps remaining: {open_loop_steps_remaining} / {args.open_loop_steps}\n"
             f"Tray yaw: {tray_yaw_deg:.2f} deg\n"
@@ -2751,6 +2796,20 @@ def main():
     last_step_time = 0.0
     cached_policy_actions: list[np.ndarray] = []
     open_loop_steps_remaining = 0
+    interactive_task_indices = _parse_index_list(args.auto_task_indices, "--auto_task_indices")
+    interactive_timeout_advance_task_indices = _parse_optional_index_set(
+        args.auto_timeout_advance_task_indices,
+        "--auto_timeout_advance_task_indices",
+    )
+    interactive_timeout_then_threshold_task_indices = _parse_optional_index_set(
+        args.auto_timeout_then_threshold_task_indices,
+        "--auto_timeout_then_threshold_task_indices",
+    )
+    interactive_timeout_then_env_success_task_indices = _parse_optional_index_set(
+        args.auto_timeout_then_env_success_task_indices,
+        "--auto_timeout_then_env_success_task_indices",
+    )
+    awaiting_continue_after_task_idx: int | None = None
     tray_base_yaw_deg = tray_yaw_deg
     tray_rotation_active = False
     tray_rotation_start_yaw = tray_yaw_deg
@@ -2820,6 +2879,7 @@ def main():
                 tray_rotation_target_yaw = tray_yaw_deg
                 tray_rotation_step_count = 0
                 recovered_task_indices.clear()
+                awaiting_continue_after_task_idx = None
                 keyboard.last_message = f"Reset done. Tray yaw={tray_yaw_deg:.2f} deg."
 
             # --- Recover a task by driving only the robot toward that task-start pose ---
@@ -2829,6 +2889,7 @@ def main():
                 cached_policy_actions = []
                 open_loop_steps_remaining = 0
                 tray_rotation_active = False
+                awaiting_continue_after_task_idx = None
                 target_task_idx = keyboard.selected_task_idx if recover_task_idx is None else recover_task_idx
                 target_task_start_state_ref = task_start_state_refs[target_task_idx]
                 use_task34_reference = target_task_idx in (2, 3) and task34_recover_state_ref is not None
@@ -2912,6 +2973,27 @@ def main():
                     )
                     print(f"[INFO] {keyboard.last_message}")
                     print(f"[INFO] Recover top joint errors: {top_recover_errors}")
+
+            if keyboard.consume_continue():
+                if episode_done:
+                    keyboard.last_message = "Episode done. Press R to reset first."
+                elif (
+                    args.interactive_multistage_continue
+                    and awaiting_continue_after_task_idx is not None
+                    and keyboard.selected_task_idx == awaiting_continue_after_task_idx
+                ):
+                    current_order_idx = interactive_task_indices.index(awaiting_continue_after_task_idx)
+                    if current_order_idx + 1 >= len(interactive_task_indices):
+                        keyboard.last_message = "No next task to continue."
+                    else:
+                        next_task_idx = interactive_task_indices[current_order_idx + 1]
+                        awaiting_continue_after_task_idx = None
+                        keyboard.select_task(next_task_idx)
+                        keyboard.running = True
+                        keyboard.last_message = f"Continuing with task {next_task_idx + 1}."
+                else:
+                    keyboard.running = True
+                    keyboard.last_message = f"Continuing task {keyboard.selected_task_idx + 1}."
 
             # --- Tray rotation ---
             if keyboard.consume_tray_rotation():
@@ -3159,6 +3241,7 @@ def main():
                     executing_policy_step
                     and keyboard.running
                     and keyboard.stop_on_task_complete
+                    and not args.interactive_multistage_continue
                     and direct_complete
                 ):
                     keyboard.running = False
@@ -3168,11 +3251,56 @@ def main():
                     )
                     print(f"[INFO] {keyboard.last_message}")
                 elif keyboard.running and task_run_step_count >= args.task_timeout_steps:
-                    keyboard.running = False
-                    keyboard.last_message = (
-                        f"Paused by timeout after {task_run_step_count} steps "
-                        f"(limit {args.task_timeout_steps})."
-                    )
+                    if args.interactive_multistage_continue:
+                        task_idx = keyboard.selected_task_idx
+                        cached_policy_actions = []
+                        open_loop_steps_remaining = 0
+                        current_order_idx = interactive_task_indices.index(task_idx)
+                        has_next_task = current_order_idx + 1 < len(interactive_task_indices)
+                        if task_idx in interactive_timeout_advance_task_indices and has_next_task:
+                            next_task_idx = interactive_task_indices[current_order_idx + 1]
+                            keyboard.select_task(next_task_idx)
+                            keyboard.running = True
+                            keyboard.last_message = (
+                                f"Task {task_idx + 1} reached timeout after {task_run_step_count} steps; "
+                                f"auto-advancing to task {next_task_idx + 1}."
+                            )
+                            print(f"[INFO] {keyboard.last_message}")
+                        elif task_idx in interactive_timeout_then_threshold_task_indices:
+                            keyboard.running = False
+                            if direct_complete:
+                                awaiting_continue_after_task_idx = task_idx
+                                keyboard.last_message = (
+                                    f"Task {task_idx + 1} reached timeout and threshold "
+                                    f"({task_complete_value:.4f} >= {selected_task_threshold:.4f}). "
+                                    "Inspect the scene, then press Continue or Recover."
+                                )
+                            else:
+                                keyboard.last_message = (
+                                    f"Task {task_idx + 1} reached timeout but did not meet threshold "
+                                    f"({task_complete_value} < {selected_task_threshold:.4f}). Recover before retrying."
+                                )
+                            print(f"[INFO] {keyboard.last_message}")
+                        elif task_idx in interactive_timeout_then_env_success_task_indices:
+                            keyboard.running = False
+                            env_success = _env_task_success(env)
+                            keyboard.last_message = (
+                                f"Task {task_idx + 1} reached timeout; env_success={env_success}. "
+                                "Press R to reset or recover if needed."
+                            )
+                            print(f"[INFO] {keyboard.last_message}")
+                        else:
+                            keyboard.running = False
+                            keyboard.last_message = (
+                                f"Paused by timeout after {task_run_step_count} steps "
+                                f"(limit {args.task_timeout_steps})."
+                            )
+                    else:
+                        keyboard.running = False
+                        keyboard.last_message = (
+                            f"Paused by timeout after {task_run_step_count} steps "
+                            f"(limit {args.task_timeout_steps})."
+                        )
             else:
                 env.sim.render()
                 time.sleep(1.0 / 60.0)

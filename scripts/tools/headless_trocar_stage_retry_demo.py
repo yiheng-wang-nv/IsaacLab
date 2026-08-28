@@ -380,6 +380,9 @@ def _find_isaac_gr00t_root(model_path: Path) -> Path:
     for candidate in [model_path, *model_path.parents]:
         if (candidate / "gr00t_config.py").exists() and (candidate / "gr00t" / "model" / "policy.py").exists():
             return candidate
+    repo_root = Path(__file__).resolve().parents[2] / "Isaac-GR00T"
+    if (repo_root / "gr00t_config.py").exists() and (repo_root / "gr00t" / "model" / "policy.py").exists():
+        return repo_root
     env_root = Path("/localhome/local-vennw/code/cosmos_gr00t/Isaac-GR00T")
     if (env_root / "gr00t_config.py").exists():
         return env_root
